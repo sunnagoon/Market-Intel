@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+env/
+*.db
+*.sqlite
+*.sqlite3
+alert_router_state.json
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+Thumbs.db
