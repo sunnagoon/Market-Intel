@@ -386,6 +386,61 @@ def _build_market_snapshot(daily_data: pd.DataFrame) -> dict[str, dict[str, floa
     return snapshot
 
 
+def _estimate_intraday_volume(
+    intraday_frame: pd.DataFrame,
+    daily_frame: pd.DataFrame,
+    session: SessionProgress,
+) -> tuple[float, str]:
+    daily_vol = pd.Series(dtype=float)
+    if isinstance(daily_frame, pd.DataFrame) and not daily_frame.empty and "Volume" in daily_frame:
+        daily_vol = pd.to_numeric(daily_frame["Volume"], errors="coerce").dropna()
+
+    today_volume = float(daily_vol.iloc[-1]) if not daily_vol.empty else 0.0
+
+    if intraday_frame.empty or "Volume" not in intraday_frame:
+        return today_volume, "daily_fallback"
+
+    raw = pd.to_numeric(intraday_frame["Volume"], errors="coerce").dropna()
+    if raw.empty:
+        return today_volume, "daily_fallback"
+
+    raw = raw[raw >= 0]
+    if raw.empty:
+        return today_volume, "daily_fallback"
+
+    intraday_sum = float(raw.sum())
+    method = "intraday_sum"
+
+    # Yahoo minute feeds can intermittently include cumulative-like spikes on ETFs
+    # (especially QQQ), which makes a plain sum unrealistically large.
+    if session.is_open:
+        daily_is_today = False
+        if isinstance(daily_frame.index, pd.DatetimeIndex) and len(daily_frame.index):
+            daily_is_today = pd.Timestamp(daily_frame.index[-1]).date() == datetime.now(US_EASTERN).date()
+
+        positive = raw[raw > 0]
+        if not positive.empty:
+            median = float(positive.median())
+            q99 = float(positive.quantile(0.99))
+            anomaly = False
+            if today_volume > 0 and intraday_sum > (today_volume * 3.0):
+                anomaly = True
+            elif median > 0 and q99 > (median * 80.0):
+                anomaly = True
+
+            if anomaly:
+                if daily_is_today and today_volume > 0:
+                    intraday_sum = today_volume
+                    method = "daily_live_fallback"
+                else:
+                    spike_cap = median * 100.0 if median > 0 else q99
+                    cleaned = positive[positive <= spike_cap]
+                    intraday_sum = float(cleaned.sum()) if not cleaned.empty else float(positive.max())
+                    method = "intraday_filtered"
+
+    return intraday_sum, method
+
+
 def _compute_volume_profile(daily_data: pd.DataFrame) -> dict[str, Any]:
     intraday = _download_batch(VOLUME_PROXY_ETFS, period="1d", interval="1m", prepost=False)
     session = get_session_progress()
@@ -404,23 +459,35 @@ def _compute_volume_profile(daily_data: pd.DataFrame) -> dict[str, Any]:
         intraday_frame = _extract_ticker_frame(intraday, ticker)
         if daily_frame.empty or "Volume" not in daily_frame:
             continue
-        avg_20d = float(daily_frame["Volume"].dropna().tail(20).mean())
-        today_volume = float(daily_frame["Volume"].dropna().iloc[-1]) if not daily_frame["Volume"].dropna().empty else 0.0
-        intraday_volume = 0.0
-        if not intraday_frame.empty and "Volume" in intraday_frame:
-            intraday_volume = float(intraday_frame["Volume"].fillna(0).sum())
+
+        daily_vol = pd.to_numeric(daily_frame["Volume"], errors="coerce").dropna()
+        if daily_vol.empty:
+            continue
+
+        avg_20d = float(daily_vol.tail(20).mean())
+        if not np.isfinite(avg_20d) or avg_20d <= 0:
+            continue
+
+        today_volume = float(daily_vol.iloc[-1])
+        intraday_volume, method = _estimate_intraday_volume(intraday_frame, daily_frame, session)
+
         observed = intraday_volume if session.is_open and intraday_volume > 0 else today_volume
         expected = avg_20d * (session.progress if session.is_open else 1.0)
-        ratio = (observed / expected) if expected > 0 else np.nan
-        total_current += observed
-        total_expected += expected
+        ratio = (observed / expected) if expected > 0 and np.isfinite(observed) else np.nan
+
+        if np.isfinite(observed):
+            total_current += float(observed)
+        if np.isfinite(expected):
+            total_expected += float(expected)
+
         component_rows.append(
             {
                 "ticker": ticker,
-                "observed_volume": observed,
-                "expected_volume": expected,
+                "observed_volume": float(observed),
+                "expected_volume": float(expected),
                 "avg_20d_volume": avg_20d,
                 "ratio": ratio,
+                "method": method if session.is_open else "daily_close",
             }
         )
 
@@ -621,7 +688,7 @@ def _build_cta_proxy(daily_data: pd.DataFrame) -> dict[str, Any]:
         last = float(close.iloc[-1])
         ma20 = float(close.tail(20).mean())
         ma100 = float(close.tail(100).mean())
-        vol20 = float(close.pct_change().tail(20).std() * np.sqrt(252))
+        vol20 = float(close.pct_change(fill_method=None).tail(20).std() * np.sqrt(252))
         vol20 = max(vol20, 0.01)
         trend_score = (1 if last > ma20 else -1) + (1 if last > ma100 else -1)
         strength = float(np.clip((last / ma100 - 1.0) / vol20, -3.0, 3.0))
@@ -951,7 +1018,7 @@ def _build_capitulation_signal(daily_data: pd.DataFrame) -> dict[str, Any]:
             "notes": "Not enough history for capitulation model windows.",
         }
 
-    base["ret"] = base["close"].pct_change()
+    base["ret"] = base["close"].pct_change(fill_method=None)
     base["range_pct"] = (base["high"] - base["low"]) / base["close"].shift(1)
     base["atr14"] = (base["high"] - base["low"]).rolling(14).mean()
     base["ma20"] = base["close"].rolling(20).mean()
@@ -966,7 +1033,7 @@ def _build_capitulation_signal(daily_data: pd.DataFrame) -> dict[str, Any]:
         frame = _extract_ticker_frame(daily_data, ticker)
         if frame.empty or "Close" not in frame:
             continue
-        s = frame["Close"].pct_change().rename(ticker)
+        s = frame["Close"].pct_change(fill_method=None).rename(ticker)
         sector_rets.append(s)
 
     breadth = pd.Series(np.nan, index=base.index)
@@ -1155,7 +1222,7 @@ def _build_sector_capitulation_signals(daily_data: pd.DataFrame) -> dict[str, An
         if len(base) < 70:
             continue
 
-        base["ret"] = base["close"].pct_change()
+        base["ret"] = base["close"].pct_change(fill_method=None)
         base["range_pct"] = (base["high"] - base["low"]) / base["close"].shift(1)
         base["atr14"] = (base["high"] - base["low"]).rolling(14).mean()
         base["ma20"] = base["close"].rolling(20).mean()
@@ -1403,7 +1470,7 @@ def _build_sector_heatmap_flow(daily_data: pd.DataFrame, sector_returns: pd.Data
         frame = _extract_ticker_frame(daily_data, ticker)
         if frame.empty or "Close" not in frame:
             continue
-        ret = frame["Close"].pct_change().rename(sector_name)
+        ret = frame["Close"].pct_change(fill_method=None).rename(sector_name)
         returns_panel.append(ret)
 
     if not returns_panel:
@@ -1676,12 +1743,12 @@ def _build_liquidity_real_rate_monitor(
 
     tlt_vol_z = pd.Series(np.nan, index=idx)
     if "TLT" in base:
-        tlt_vol = base["TLT"].pct_change().rolling(20).std() * np.sqrt(252)
+        tlt_vol = base["TLT"].pct_change(fill_method=None).rolling(20).std() * np.sqrt(252)
         tlt_vol_z = _rolling_z(tlt_vol, 126)
 
     funding_pressure = pd.Series(np.nan, index=idx)
     if "SHY" in base:
-        shy_1m = base["SHY"].pct_change(21)
+        shy_1m = base["SHY"].pct_change(21, fill_method=None)
         funding_pressure = -shy_1m
 
     spy_volume_ratio = pd.Series(np.nan, index=idx)

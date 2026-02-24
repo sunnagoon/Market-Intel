@@ -122,6 +122,27 @@ def _inject_css() -> None:
             padding: 10px 12px;
             margin: 4px 0 10px 0;
         }
+        [data-testid="stSidebar"] .stButton > button {
+            border: 1px solid rgba(126, 163, 204, 0.35);
+            border-radius: 10px;
+            background: linear-gradient(170deg, rgba(14, 34, 57, 0.94) 0%, rgba(9, 24, 41, 0.96) 100%);
+            color: #f8fbff !important;
+            margin-bottom: 0.2rem;
+        }
+        [data-testid="stSidebar"] .stButton > button:hover {
+            border-color: rgba(157, 196, 236, 0.70);
+        }
+        [data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] * {
+            color: #f8fbff !important;
+            text-shadow: none !important;
+        }
+        .focus-banner {
+            border: 1px solid rgba(125, 165, 208, 0.36);
+            background: rgba(10, 27, 46, 0.72);
+            border-radius: 12px;
+            padding: 10px 12px;
+            margin: 0 0 14px 0;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -131,6 +152,30 @@ def _inject_css() -> None:
 @st.cache_data(ttl=30, show_spinner=False)
 def _get_payload() -> dict:
     return build_dashboard_payload()
+
+SECTION_NAV_ITEMS = [
+    ("overview", "Overview"),
+    ("alerts", "Signal Alerts"),
+    ("regime_cross", "Regime + Cross-Asset"),
+    ("event_watch", "Event Risk + Watchlist"),
+    ("liquidity", "Liquidity / Real Rates"),
+    ("put_skew", "Put Skew"),
+    ("capitulation", "Capitulation"),
+    ("sector_capitulation", "Sector Capitulation"),
+    ("signal_quality", "Signal Quality"),
+    ("volume", "Volume"),
+    ("rotation", "Sector Rotation"),
+    ("sector_flow", "Sector Flow"),
+    ("factor_baskets", "Factor Baskets"),
+    ("yield_curve", "Yield Curve"),
+    ("sectors", "Sector Performance"),
+    ("cta", "CTA Proxy"),
+    ("alert_routing", "Alert Routing"),
+    ("history", "Historical Trace"),
+    ("headlines", "Headlines"),
+]
+SECTION_LABEL_BY_KEY = {key: label for key, label in SECTION_NAV_ITEMS}
+SECTION_KEY_BY_LABEL = {label: key for key, label in SECTION_NAV_ITEMS}
 
 
 def _pct_color(value: float) -> str:
@@ -653,8 +698,20 @@ def _render_volume_panel(volume_profile: dict) -> None:
             comp["ratio"] = comp["ratio"].map(lambda x: f"{x:.2f}x" if pd.notna(x) else "n/a")
             comp["observed_volume"] = comp["observed_volume"].map(lambda x: f"{x:,.0f}")
             comp["expected_volume"] = comp["expected_volume"].map(lambda x: f"{x:,.0f}")
+            if "method" in comp.columns:
+                method_map = {
+                    "intraday_sum": "Intraday sum",
+                    "intraday_filtered": "Intraday filtered",
+                    "daily_live_fallback": "Daily live fallback",
+                    "daily_close": "Daily close",
+                    "daily_fallback": "Daily fallback",
+                }
+                comp["method"] = comp["method"].map(lambda x: method_map.get(str(x), str(x)))
+            display_cols = ["ticker", "ratio", "observed_volume", "expected_volume"]
+            if "method" in comp.columns:
+                display_cols.append("method")
             st.dataframe(
-                comp[["ticker", "ratio", "observed_volume", "expected_volume"]],
+                comp[display_cols],
                 width='stretch',
                 hide_index=True,
             )
@@ -1658,12 +1715,112 @@ def _render_history_panel(history_df: pd.DataFrame) -> None:
         st.metric("Snapshots", f"{len(history_df)}", delta=last_ts.strftime("%m-%d %I:%M %p"))
 
 
+def _as_float(value: object) -> float:
+    try:
+        if value is None:
+            return np.nan
+        return float(value)
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _section_visible(selected_section: str, section_key: str) -> bool:
+    return selected_section == "__all__" or selected_section == section_key
+
+
+def _render_sidebar_navigation() -> str:
+    if "selected_section" not in st.session_state:
+        st.session_state["selected_section"] = "__all__"
+
+    st.sidebar.markdown("### Navigation")
+
+    quick_targets = [
+        ("Overview", "overview"),
+        ("Liquidity", "liquidity"),
+        ("Yield Curve", "yield_curve"),
+        ("Capitulation", "capitulation"),
+        ("Headlines", "headlines"),
+    ]
+    q1, q2 = st.sidebar.columns(2)
+    for idx, (label, key) in enumerate(quick_targets):
+        col = q1 if idx % 2 == 0 else q2
+        with col:
+            if st.button(label, key=f"quick_nav_{key}", width="stretch"):
+                st.session_state["selected_section"] = key
+
+    if st.sidebar.button("Full Dashboard", key="quick_nav_all", width="stretch"):
+        st.session_state["selected_section"] = "__all__"
+
+    options = ["Full Dashboard"] + [label for _, label in SECTION_NAV_ITEMS]
+    selected_key = st.session_state.get("selected_section", "__all__")
+    selected_label = "Full Dashboard" if selected_key == "__all__" else SECTION_LABEL_BY_KEY.get(selected_key, "Full Dashboard")
+    default_index = options.index(selected_label) if selected_label in options else 0
+
+    choice = st.sidebar.selectbox("View section", options, index=default_index)
+    st.session_state["selected_section"] = "__all__" if choice == "Full Dashboard" else SECTION_KEY_BY_LABEL.get(choice, "__all__")
+
+    return st.session_state["selected_section"]
+
+
+def _render_quick_status_bar(payload: dict, routing_status: dict) -> None:
+    sentiment = payload.get("sentiment", {})
+    volume_profile = payload.get("volume_profile", {})
+    liquidity = payload.get("liquidity_monitor", {})
+    yield_curve = payload.get("yield_curve", {})
+
+    sent_score = _as_float(sentiment.get("composite_score"))
+    vol_ratio = _as_float(volume_profile.get("ratio"))
+    liq_score = _as_float(liquidity.get("liquidity_score"))
+
+    alerts = payload.get("alerts", [])
+    alert_count = len(alerts) if isinstance(alerts, list) else 0
+    routed_count = int(routing_status.get("sent_count", 0)) if isinstance(routing_status, dict) else 0
+    error_count = int(routing_status.get("error_count", 0)) if isinstance(routing_status, dict) else 0
+
+    st.markdown("<div class='panel'>", unsafe_allow_html=True)
+    st.markdown("#### Dashboard Pulse")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        st.metric(
+            "Sentiment",
+            str(sentiment.get("regime", "n/a")),
+            delta=f"{sent_score:+.1f}" if pd.notna(sent_score) else "n/a",
+        )
+    with c2:
+        st.metric(
+            "Volume",
+            str(volume_profile.get("regime", "n/a")),
+            delta=f"{vol_ratio:.2f}x" if pd.notna(vol_ratio) else "n/a",
+        )
+    with c3:
+        st.metric(
+            "Liquidity",
+            str(liquidity.get("liquidity_regime", "n/a")),
+            delta=f"Stress {liq_score:.0f}" if pd.notna(liq_score) else "n/a",
+        )
+    with c4:
+        st.metric(
+            "Yield Curve",
+            str(yield_curve.get("curve_state", "n/a")),
+            delta=str(yield_curve.get("week_trend", "n/a")),
+        )
+    with c5:
+        st.metric(
+            "Alerts",
+            str(alert_count),
+            delta=f"Routed {routed_count} | Err {error_count}",
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
 def main() -> None:
     _inject_css()
+
     st.sidebar.header("Controls")
     auto_refresh = st.sidebar.toggle("Auto refresh", value=True)
     refresh_seconds = st.sidebar.slider("Refresh interval (sec)", min_value=30, max_value=300, value=60, step=15)
-    manual_refresh = st.sidebar.button("Refresh now")
+    manual_refresh = st.sidebar.button("Refresh now", width="stretch")
+    selected_section = _render_sidebar_navigation()
 
     if manual_refresh:
         st.cache_data.clear()
@@ -1693,100 +1850,135 @@ def main() -> None:
     history_df = load_snapshot_history(hours=72)
     alert_history = load_alert_history(limit=80)
 
+    updated_at = payload.get("updated_at")
+    updated_text = updated_at.strftime("%Y-%m-%d %I:%M:%S %p ET") if isinstance(updated_at, datetime) else "n/a"
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Session Snapshot")
+    st.sidebar.markdown(f"<div class='mono'>Last refresh: {updated_text}</div>", unsafe_allow_html=True)
+    st.sidebar.markdown(f"<div class='mono'>Headlines: {len(payload.get('headlines', []))}</div>", unsafe_allow_html=True)
+    st.sidebar.markdown(f"<div class='mono'>Active alerts: {len(payload.get('alerts', []))}</div>", unsafe_allow_html=True)
+
     _render_header(payload["updated_at"])
     st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
     _render_market_metrics(payload["snapshot"])
-    st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:10px;'></div>", unsafe_allow_html=True)
+    _render_quick_status_bar(payload, routing_status)
 
-    left, right = st.columns([1.6, 1.0])
-    with left:
-        _render_narrative(payload["narrative"])
-    with right:
+    if selected_section != "__all__":
+        section_label = html.escape(SECTION_LABEL_BY_KEY.get(selected_section, selected_section))
+        st.markdown(
+            f"<div class='focus-banner'><strong>Focus Mode:</strong> {section_label}. Use sidebar navigation to jump or return to Full Dashboard.</div>",
+            unsafe_allow_html=True,
+        )
+
+    if _section_visible(selected_section, "overview"):
+        left, right = st.columns([1.6, 1.0])
+        with left:
+            _render_narrative(payload.get("narrative", []))
+        with right:
+            st.markdown("<div class='panel'>", unsafe_allow_html=True)
+            _render_sentiment_panel(payload.get("sentiment", {}))
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    if _section_visible(selected_section, "alerts"):
+        _render_alerts(payload.get("alerts", []), alert_history)
+
+    if _section_visible(selected_section, "regime_cross"):
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            st.markdown("<div class='panel'>", unsafe_allow_html=True)
+            _render_regime_panel(payload.get("regime_engine", {}))
+            st.markdown("</div>", unsafe_allow_html=True)
+        with c2:
+            st.markdown("<div class='panel'>", unsafe_allow_html=True)
+            _render_cross_asset_panel(payload.get("cross_asset_confirmation", {}))
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    if _section_visible(selected_section, "event_watch"):
+        c3, c4 = st.columns([1, 1])
+        with c3:
+            st.markdown("<div class='panel'>", unsafe_allow_html=True)
+            _render_event_risk_panel(payload.get("event_risk", {}))
+            st.markdown("</div>", unsafe_allow_html=True)
+        with c4:
+            st.markdown("<div class='panel'>", unsafe_allow_html=True)
+            _render_watchlist_panel(payload.get("watchlist", {}))
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    if _section_visible(selected_section, "liquidity"):
         st.markdown("<div class='panel'>", unsafe_allow_html=True)
-        _render_sentiment_panel(payload["sentiment"])
+        _render_liquidity_real_rate_panel(payload.get("liquidity_monitor", {}))
         st.markdown("</div>", unsafe_allow_html=True)
 
-    _render_alerts(payload.get("alerts", []), alert_history)
-
-    c1, c2 = st.columns([1, 1])
-    with c1:
+    if _section_visible(selected_section, "put_skew"):
         st.markdown("<div class='panel'>", unsafe_allow_html=True)
-        _render_regime_panel(payload.get("regime_engine", {}))
-        st.markdown("</div>", unsafe_allow_html=True)
-    with c2:
-        st.markdown("<div class='panel'>", unsafe_allow_html=True)
-        _render_cross_asset_panel(payload.get("cross_asset_confirmation", {}))
+        _render_put_skew_panel(payload.get("put_skew", {}))
         st.markdown("</div>", unsafe_allow_html=True)
 
-    c3, c4 = st.columns([1, 1])
-    with c3:
+    if _section_visible(selected_section, "capitulation"):
         st.markdown("<div class='panel'>", unsafe_allow_html=True)
-        _render_event_risk_panel(payload.get("event_risk", {}))
-        st.markdown("</div>", unsafe_allow_html=True)
-    with c4:
-        st.markdown("<div class='panel'>", unsafe_allow_html=True)
-        _render_watchlist_panel(payload.get("watchlist", {}))
+        _render_capitulation_panel(payload.get("capitulation", {}))
         st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    _render_liquidity_real_rate_panel(payload.get("liquidity_monitor", {}))
-    st.markdown("</div>", unsafe_allow_html=True)
+    if _section_visible(selected_section, "sector_capitulation"):
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        _render_sector_capitulation_panel(payload.get("sector_capitulation", {}))
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    _render_put_skew_panel(payload.get("put_skew", {}))
-    st.markdown("</div>", unsafe_allow_html=True)
+    if _section_visible(selected_section, "signal_quality"):
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        _render_signal_quality_panel(payload.get("signal_quality", {}))
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    _render_capitulation_panel(payload.get("capitulation", {}))
-    st.markdown("</div>", unsafe_allow_html=True)
+    if _section_visible(selected_section, "volume"):
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        _render_volume_panel(payload.get("volume_profile", {}))
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    _render_sector_capitulation_panel(payload.get("sector_capitulation", {}))
-    st.markdown("</div>", unsafe_allow_html=True)
+    if _section_visible(selected_section, "rotation"):
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        _render_rotation_panel(payload.get("rotation_signal", {}))
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    _render_signal_quality_panel(payload.get("signal_quality", {}))
-    st.markdown("</div>", unsafe_allow_html=True)
+    if _section_visible(selected_section, "sector_flow"):
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        _render_sector_flow_panel(payload.get("sector_flow", {}))
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    _render_volume_panel(payload["volume_profile"])
-    st.markdown("</div>", unsafe_allow_html=True)
+    if _section_visible(selected_section, "factor_baskets"):
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        _render_factor_basket_panel(payload.get("factor_baskets", {}))
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    _render_rotation_panel(payload.get("rotation_signal", {}))
-    st.markdown("</div>", unsafe_allow_html=True)
+    if _section_visible(selected_section, "yield_curve"):
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        _render_yield_curve_panel(payload.get("yield_curve", {}))
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    _render_sector_flow_panel(payload.get("sector_flow", {}))
-    st.markdown("</div>", unsafe_allow_html=True)
+    if _section_visible(selected_section, "sectors"):
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        _render_sector_panels(payload.get("sector_returns", pd.DataFrame()))
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    _render_factor_basket_panel(payload.get("factor_baskets", {}))
-    st.markdown("</div>", unsafe_allow_html=True)
+    if _section_visible(selected_section, "cta"):
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        _render_cta_panel(payload.get("cta_proxy", {}))
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    _render_yield_curve_panel(payload.get("yield_curve", {}))
-    st.markdown("</div>", unsafe_allow_html=True)
+    if _section_visible(selected_section, "alert_routing"):
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        _render_alert_routing_panel(routing_status)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    _render_sector_panels(payload["sector_returns"])
-    st.markdown("</div>", unsafe_allow_html=True)
+    if _section_visible(selected_section, "history"):
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        _render_history_panel(history_df)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    _render_cta_panel(payload["cta_proxy"])
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    _render_alert_routing_panel(routing_status)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    _render_history_panel(history_df)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    _render_headlines(payload["headlines"])
-    st.markdown("</div>", unsafe_allow_html=True)
+    if _section_visible(selected_section, "headlines"):
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        _render_headlines(payload.get("headlines", []))
+        st.markdown("</div>", unsafe_allow_html=True)
 
     if auto_refresh:
         st.sidebar.markdown(f"<div class='mono'>Next refresh in {refresh_seconds}s</div>", unsafe_allow_html=True)
