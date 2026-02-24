@@ -107,6 +107,44 @@ CROSS_ASSET_EXTRA_TICKERS = {"LQD"}
 LIQUIDITY_MONITOR_TICKERS = {"TIP", "IEF", "HYG", "LQD", "UUP", "TLT", "SHY"}
 PUT_SKEW_UNDERLYINGS = ["SPY", "QQQ", "IWM"]
 
+FACTOR_BASKETS = {
+    "Neoclouds": ["SNOW", "MDB", "DDOG", "NET", "ESTC", "CFLT", "GTLB"],
+    "Hyperscalers": ["MSFT", "AMZN", "GOOGL", "META", "ORCL"],
+    "Cybersecurity": ["CRWD", "PANW", "ZS", "FTNT", "OKTA", "CYBR", "S"],
+    "Shipping": ["ZIM", "MATX", "SBLK", "EGLE", "DAC", "CMRE"],
+    "Tankers": ["FRO", "NAT", "TNK", "DHT", "STNG"],
+    "Small-Cap Oilfield Services": ["NINE", "KLXE", "RES", "OIS", "PUMP", "LBRT"],
+    "Semicap Equipment": ["ASML", "AMAT", "LRCX", "KLAC", "TER"],
+    "AI Infra / Data Center": ["NVDA", "AVGO", "ANET", "SMCI", "VRT", "EQIX"],
+    "Homebuilders": ["DHI", "LEN", "PHM", "TOL", "KBH"],
+    "Regional Banks": ["KRE", "FITB", "KEY", "RF", "HBAN"],
+    "Internet / Ad-Tech": ["GOOGL", "META", "TTD", "PINS", "SNAP"],
+    "Fintech / Payments": ["PYPL", "XYZ", "MA", "V", "FIS"],
+    "Asset Managers / Alts": ["BLK", "KKR", "BX", "APO", "CG"],
+    "Insurance Brokers": ["AJG", "MMC", "AON", "BRO", "WTW"],
+    "Aerospace & Defense": ["LMT", "NOC", "RTX", "GD", "LHX"],
+    "Nuclear & Uranium": ["CCJ", "UEC", "SMR", "BWXT", "LEU"],
+    "Gold Miners": ["NEM", "AEM", "GOLD", "KGC", "WPM"],
+    "Copper / Base Metals": ["FCX", "SCCO", "TECK", "AA", "BHP"],
+    "LNG & Nat Gas": ["LNG", "EQT", "AR", "RRC", "CTRA"],
+    "Travel / Leisure": ["BKNG", "ABNB", "RCL", "CCL", "NCLH"],
+    "Airlines": ["DAL", "UAL", "AAL", "LUV", "ALK"],
+    "Restaurants": ["CMG", "SBUX", "DPZ", "YUM", "DRI"],
+    "MedTech Devices": ["ISRG", "SYK", "BSX", "MDT", "ABT"],
+    "Biotech Innovators": ["XBI", "CRSP", "BEAM", "NTLA", "IONS"],
+    "EV Supply Chain": ["TSLA", "ALB", "SQM", "ON", "MP"],
+    "Utilities / Power Demand": ["CEG", "VST", "NRG", "AES", "NEE"],
+    "Industrial Automation": ["ETN", "ROK", "EMR", "HON", "PH"],
+    "Data Center Power / Grid": ["VRT", "ETN", "HUBB", "PWR", "GEV"],
+    "Railroads / Freight": ["UNP", "CSX", "NSC", "CP", "CNI"],
+    "Space / Defense Tech": ["RKLB", "LUNR", "ASTS", "IRDM", "SPCE"],
+    "Crypto Proxies": ["COIN", "MSTR", "MARA", "RIOT", "IBIT"],
+    "Quantum / Next-Gen Compute": ["IONQ", "RGTI", "QBTS", "QUBT", "QTUM"],
+    "Cloud IT Services": ["ACN", "IBM", "CTSH", "EPAM", "INFY"],
+    "Housing Upstream": ["BLD", "JCI", "MAS", "TREX", "OC"],
+    "Retail / Off-Price": ["TJX", "ROST", "BURL", "COST", "WMT"],
+}
+
 DEFAULT_WATCHLIST = ["SPY", "QQQ", "IWM", "TLT", "UUP", "GLD", "HYG", "LQD", "XLF", "XLK"]
 
 FOMC_CALENDAR = {
@@ -215,6 +253,123 @@ def _build_sector_returns(daily_data: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values("daily", ascending=False).reset_index(drop=True) if not out.empty else out
 
 
+def _factor_ticker_universe() -> set[str]:
+    out: set[str] = set()
+    for members in FACTOR_BASKETS.values():
+        out.update(members)
+    return out
+
+
+def _build_factor_baskets(daily_data: pd.DataFrame) -> dict[str, Any]:
+    spy_frame = _extract_ticker_frame(daily_data, "SPY")
+    spy_close = spy_frame["Close"].dropna() if not spy_frame.empty and "Close" in spy_frame else pd.Series(dtype=float)
+    spy_daily = _safe_return(spy_close, 1) if not spy_close.empty else np.nan
+    spy_weekly = _safe_return(spy_close, 5) if not spy_close.empty else np.nan
+    spy_monthly = _safe_return(spy_close, 21) if not spy_close.empty else np.nan
+
+    summary_rows: list[dict[str, Any]] = []
+    holdings_map: dict[str, pd.DataFrame] = {}
+    history_map: dict[str, pd.DataFrame] = {}
+
+    for basket_name, members in FACTOR_BASKETS.items():
+        member_rows: list[dict[str, Any]] = []
+        close_series: list[pd.Series] = []
+
+        for ticker in members:
+            frame = _extract_ticker_frame(daily_data, ticker)
+            close = frame["Close"].dropna() if not frame.empty and "Close" in frame else pd.Series(dtype=float)
+            available = len(close) >= 22
+
+            if not close.empty:
+                close_series.append(close.rename(ticker))
+
+            member_rows.append(
+                {
+                    "ticker": ticker,
+                    "name": _ticker_label(ticker),
+                    "daily": _safe_return(close, 1) if available else np.nan,
+                    "weekly": _safe_return(close, 5) if available else np.nan,
+                    "monthly": _safe_return(close, 21) if available else np.nan,
+                    "available": available,
+                }
+            )
+
+        holdings = pd.DataFrame(member_rows)
+        if not holdings.empty:
+            holdings = holdings.sort_values("daily", ascending=False, na_position="last").reset_index(drop=True)
+
+        available_holdings = int(holdings["available"].sum()) if not holdings.empty and "available" in holdings else 0
+        total_holdings = int(len(holdings))
+
+        breadth_daily = float((holdings["daily"] > 0).mean()) if not holdings.empty and holdings["daily"].notna().any() else np.nan
+        breadth_weekly = float((holdings["weekly"] > 0).mean()) if not holdings.empty and holdings["weekly"].notna().any() else np.nan
+        breadth_monthly = float((holdings["monthly"] > 0).mean()) if not holdings.empty and holdings["monthly"].notna().any() else np.nan
+
+        basket_daily = np.nan
+        basket_weekly = np.nan
+        basket_monthly = np.nan
+        rel_daily = np.nan
+        rel_weekly = np.nan
+        rel_monthly = np.nan
+        history = pd.DataFrame(columns=["date", "basket_index", "rel_vs_spy"])
+
+        if close_series:
+            panel = pd.concat(close_series, axis=1).sort_index().ffill().dropna(how="all")
+            if not panel.empty:
+                panel = panel.tail(220)
+                norm = panel.divide(panel.iloc[0])
+                basket_index = norm.mean(axis=1)
+
+                basket_daily = _safe_return(basket_index, 1)
+                basket_weekly = _safe_return(basket_index, 5)
+                basket_monthly = _safe_return(basket_index, 21)
+
+                rel_daily = basket_daily - spy_daily if pd.notna(basket_daily) and pd.notna(spy_daily) else np.nan
+                rel_weekly = basket_weekly - spy_weekly if pd.notna(basket_weekly) and pd.notna(spy_weekly) else np.nan
+                rel_monthly = basket_monthly - spy_monthly if pd.notna(basket_monthly) and pd.notna(spy_monthly) else np.nan
+
+                history = pd.DataFrame({"date": basket_index.index, "basket_index": basket_index.values})
+                if not spy_close.empty:
+                    rel_panel = pd.concat([basket_index.rename("basket"), spy_close.rename("spy")], axis=1).dropna()
+                    if not rel_panel.empty:
+                        rel_series = rel_panel["basket"] / rel_panel["spy"]
+                        history["rel_vs_spy"] = rel_series.reindex(history["date"]).values
+                    else:
+                        history["rel_vs_spy"] = np.nan
+                else:
+                    history["rel_vs_spy"] = np.nan
+
+        summary_rows.append(
+            {
+                "basket": basket_name,
+                "daily": basket_daily,
+                "weekly": basket_weekly,
+                "monthly": basket_monthly,
+                "rel_vs_spy_daily": rel_daily,
+                "rel_vs_spy_weekly": rel_weekly,
+                "rel_vs_spy_monthly": rel_monthly,
+                "breadth_daily": breadth_daily,
+                "breadth_weekly": breadth_weekly,
+                "breadth_monthly": breadth_monthly,
+                "holdings_available": available_holdings,
+                "holdings_total": total_holdings,
+            }
+        )
+        holdings_map[basket_name] = holdings
+        history_map[basket_name] = history.tail(180).reset_index(drop=True)
+
+    summary = pd.DataFrame(summary_rows)
+    if not summary.empty:
+        summary = summary.sort_values("daily", ascending=False, na_position="last").reset_index(drop=True)
+
+    return {
+        "summary": summary,
+        "holdings": holdings_map,
+        "history": history_map,
+        "notes": "Baskets are equal-weight custom sleeves. Click/select a basket to inspect holdings and relative trend.",
+    }
+
+
 def _build_market_snapshot(daily_data: pd.DataFrame) -> dict[str, dict[str, float]]:
     snapshot: dict[str, dict[str, float]] = {}
     for ticker, label in MARKET_TICKERS.items():
@@ -234,6 +389,12 @@ def _build_market_snapshot(daily_data: pd.DataFrame) -> dict[str, dict[str, floa
 def _compute_volume_profile(daily_data: pd.DataFrame) -> dict[str, Any]:
     intraday = _download_batch(VOLUME_PROXY_ETFS, period="1d", interval="1m", prepost=False)
     session = get_session_progress()
+    session_payload = {
+        "is_open": bool(session.is_open),
+        "elapsed_minutes": int(session.elapsed_minutes),
+        "progress": float(session.progress),
+        "label": str(session.label),
+    }
     component_rows: list[dict[str, Any]] = []
     total_current = 0.0
     total_expected = 0.0
@@ -276,7 +437,7 @@ def _compute_volume_profile(daily_data: pd.DataFrame) -> dict[str, Any]:
         regime = "Very heavy volume"
 
     return {
-        "session": session,
+        "session": session_payload,
         "ratio": total_ratio,
         "regime": regime,
         "components": pd.DataFrame(component_rows),
@@ -2411,7 +2572,10 @@ def _build_market_narrative(
     ratio = volume_profile.get("ratio", np.nan)
     regime = volume_profile.get("regime", "Unavailable")
     session = volume_profile.get("session")
-    session_label = session.label if session else "Session"
+    if isinstance(session, dict):
+        session_label = str(session.get("label", "Session"))
+    else:
+        session_label = getattr(session, "label", "Session")
     line3 = (
         f"Volume regime: {regime}. Composite tape is {ratio:.2f}x expected for {session_label}."
         if not np.isnan(ratio)
@@ -2473,6 +2637,7 @@ def build_dashboard_payload() -> dict[str, Any]:
             + list(CTA_PROXY_TICKERS.keys())
             + list(CROSS_ASSET_EXTRA_TICKERS)
             + list(LIQUIDITY_MONITOR_TICKERS)
+            + list(_factor_ticker_universe())
             + watchlist_tickers
         )
     )
@@ -2490,6 +2655,7 @@ def build_dashboard_payload() -> dict[str, Any]:
     sector_capitulation = _build_sector_capitulation_signals(daily_data)
     signal_quality = _build_signal_quality_tracker(daily_data, capitulation, sector_capitulation)
     sector_flow = _build_sector_heatmap_flow(daily_data, sector_returns)
+    factor_baskets = _build_factor_baskets(daily_data)
     watchlist = _build_watchlist_monitor(daily_data)
     cross_asset_confirmation = _build_cross_asset_confirmation(snapshot, daily_data, sentiment, rotation_signal, cta_proxy)
     regime_engine = _build_regime_engine(snapshot, sentiment, volume_profile, rotation_signal, yield_curve, cross_asset_confirmation, cta_proxy)
@@ -2531,6 +2697,7 @@ def build_dashboard_payload() -> dict[str, Any]:
         "sector_capitulation": sector_capitulation,
         "signal_quality": signal_quality,
         "sector_flow": sector_flow,
+        "factor_baskets": factor_baskets,
         "watchlist": watchlist,
         "cross_asset_confirmation": cross_asset_confirmation,
         "regime_engine": regime_engine,

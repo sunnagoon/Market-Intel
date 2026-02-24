@@ -72,6 +72,12 @@ def _inject_css() -> None:
             color: #f8fbff !important;
             text-shadow: 0 0 8px rgba(255, 255, 255, 0.16);
         }
+        [data-testid="stSelectbox"] [data-baseweb="select"] *,
+        [data-baseweb="popover"] [role="option"],
+        [data-baseweb="menu"] * {
+            color: #111111 !important;
+            text-shadow: none !important;
+        }
         .panel {
             background: linear-gradient(180deg, rgba(10, 24, 43, 0.88) 0%, rgba(8, 22, 40, 0.94) 100%);
             border: 1px solid rgba(125, 165, 208, 0.28);
@@ -404,7 +410,7 @@ def _render_alerts(alerts: list[dict], alert_history: pd.DataFrame) -> None:
     else:
         view = alert_history.copy()
         view["time"] = view["timestamp_et"].dt.strftime("%m-%d %I:%M %p")
-        st.dataframe(view[["time", "severity", "message"]].head(12), use_container_width=True, hide_index=True)
+        st.dataframe(view[["time", "severity", "message"]].head(12), width='stretch', hide_index=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -506,13 +512,13 @@ def _render_capitulation_panel(capitulation: dict) -> None:
     c1, c2 = st.columns([1, 1])
     with c1:
         if pd.notna(down):
-            st.plotly_chart(_gauge(float(down), "Downside Capitulation", 0, 100), use_container_width=True)
+            st.plotly_chart(_gauge(float(down), "Downside Capitulation", 0, 100), width='stretch')
             st.markdown(f"**Status:** {capitulation.get('downside_status', 'n/a')}")
         else:
             st.info("Downside score unavailable.")
     with c2:
         if pd.notna(up):
-            st.plotly_chart(_gauge(float(up), "Upside Exhaustion", 0, 100), use_container_width=True)
+            st.plotly_chart(_gauge(float(up), "Upside Exhaustion", 0, 100), width='stretch')
             st.markdown(f"**Status:** {capitulation.get('upside_status', 'n/a')}")
         else:
             st.info("Upside score unavailable.")
@@ -522,7 +528,7 @@ def _render_capitulation_panel(capitulation: dict) -> None:
 
     hist = capitulation.get("score_history", pd.DataFrame())
     if isinstance(hist, pd.DataFrame) and not hist.empty:
-        st.plotly_chart(_capitulation_history_chart(hist, threshold), use_container_width=True)
+        st.plotly_chart(_capitulation_history_chart(hist, threshold), width='stretch')
     else:
         st.info("Score history unavailable.")
 
@@ -537,11 +543,11 @@ def _render_capitulation_panel(capitulation: dict) -> None:
         if "reversal_return" in show.columns:
             show["reversal_return"] = show["reversal_return"].map(lambda x: f"{x * 100:+.2f}%" if pd.notna(x) else "n/a")
         if "confirmation_bars" in show.columns:
-            show["confirmation_bars"] = show["confirmation_bars"].map(lambda x: int(x) if pd.notna(x) else "-")
+            show["confirmation_bars"] = show["confirmation_bars"].map(lambda x: f"{int(x)}" if pd.notna(x) else "-")
 
         st.dataframe(
             show[["trigger_date", "direction", "trigger_score", "state", "confirmation_bars", "reversal_return"]].head(20),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
     else:
@@ -557,7 +563,7 @@ def _render_sector_capitulation_panel(sector_cap: dict) -> None:
 
     table = sector_cap.get("table", pd.DataFrame())
     if isinstance(table, pd.DataFrame) and not table.empty:
-        st.plotly_chart(_sector_capitulation_scores_chart(table, threshold), use_container_width=True)
+        st.plotly_chart(_sector_capitulation_scores_chart(table, threshold), width='stretch')
 
         show = table.copy()
         if "downside_score" in show.columns:
@@ -582,7 +588,7 @@ def _render_sector_capitulation_panel(sector_cap: dict) -> None:
                     "upside_status",
                 ]
             ],
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
     else:
@@ -599,7 +605,7 @@ def _render_sector_capitulation_panel(sector_cap: dict) -> None:
         if "reversal_return" in show.columns:
             show["reversal_return"] = show["reversal_return"].map(lambda x: f"{x * 100:+.2f}%" if pd.notna(x) else "n/a")
         if "confirmation_bars" in show.columns:
-            show["confirmation_bars"] = show["confirmation_bars"].map(lambda x: int(x) if pd.notna(x) else "-")
+            show["confirmation_bars"] = show["confirmation_bars"].map(lambda x: f"{int(x)}" if pd.notna(x) else "-")
 
         st.dataframe(
             show[
@@ -614,7 +620,7 @@ def _render_sector_capitulation_panel(sector_cap: dict) -> None:
                     "reversal_return",
                 ]
             ].head(40),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
     else:
@@ -625,14 +631,18 @@ def _render_volume_panel(volume_profile: dict) -> None:
     ratio = volume_profile.get("ratio", np.nan)
     regime = volume_profile.get("regime", "Unavailable")
     session = volume_profile.get("session")
-    session_label = session.label if session else "Session"
-    progress = session.progress * 100 if session else 0
+    if isinstance(session, dict):
+        session_label = str(session.get("label", "Session"))
+        progress = float(session.get("progress", 0.0)) * 100
+    else:
+        session_label = getattr(session, "label", "Session")
+        progress = float(getattr(session, "progress", 0.0)) * 100
     col1, col2 = st.columns([1, 1])
     with col1:
         if np.isnan(ratio):
             st.info("Volume ratio unavailable from current feed.")
         else:
-            st.plotly_chart(_gauge(ratio, "Volume vs Expected", 0, 2.2, "x"), use_container_width=True)
+            st.plotly_chart(_gauge(ratio, "Volume vs Expected", 0, 2.2, "x"), width='stretch')
         st.markdown(
             f"<div class='mono'>Regime: {regime} | Session: {session_label} | Progress: {progress:.0f}%</div>",
             unsafe_allow_html=True,
@@ -645,7 +655,7 @@ def _render_volume_panel(volume_profile: dict) -> None:
             comp["expected_volume"] = comp["expected_volume"].map(lambda x: f"{x:,.0f}")
             st.dataframe(
                 comp[["ticker", "ratio", "observed_volume", "expected_volume"]],
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
             )
         else:
@@ -663,7 +673,7 @@ def _render_rotation_panel(rotation_signal: dict) -> None:
         if np.isnan(spread_d):
             st.info("Rotation signal unavailable.")
         else:
-            st.plotly_chart(_gauge(spread_d * 100, "Daily Cyc-Def Spread", -3, 3, "%"), use_container_width=True)
+            st.plotly_chart(_gauge(spread_d * 100, "Daily Cyc-Def Spread", -3, 3, "%"), width='stretch')
         st.markdown(f"**Regime:** {rotation_signal.get('regime', 'n/a')}")
         st.markdown(f"**Daily Spread:** {_format_pct(spread_d)}")
         st.markdown(f"**Weekly Spread:** {_format_pct(spread_w)}")
@@ -671,7 +681,7 @@ def _render_rotation_panel(rotation_signal: dict) -> None:
     with c2:
         history = rotation_signal.get("ratio_history", pd.DataFrame())
         if isinstance(history, pd.DataFrame) and not history.empty:
-            st.plotly_chart(_rotation_ratio_chart(history), use_container_width=True)
+            st.plotly_chart(_rotation_ratio_chart(history), width='stretch')
         else:
             st.info("Rotation ratio history unavailable.")
 
@@ -773,10 +783,10 @@ def _render_yield_curve_panel(yield_curve: dict) -> None:
     with c1:
         ytbl = yield_curve.get("yields_table", pd.DataFrame())
         if isinstance(ytbl, pd.DataFrame) and not ytbl.empty:
-            st.plotly_chart(_yield_curve_shape_chart(ytbl), use_container_width=True)
+            st.plotly_chart(_yield_curve_shape_chart(ytbl), width='stretch')
             table = ytbl.copy()
             table["yield_pct"] = table["yield_pct"].map(lambda x: f"{x:.2f}%")
-            st.dataframe(table[["tenor", "yield_pct", "source"]], use_container_width=True, hide_index=True)
+            st.dataframe(table[["tenor", "yield_pct", "source"]], width='stretch', hide_index=True)
         else:
             st.info("Yield tenor data unavailable.")
 
@@ -789,7 +799,7 @@ def _render_yield_curve_panel(yield_curve: dict) -> None:
         }
         primary_col = spread_col_map.get(primary_name)
         if isinstance(spread_history, pd.DataFrame) and not spread_history.empty and primary_col:
-            st.plotly_chart(_yield_spread_history_chart(spread_history, primary_col), use_container_width=True)
+            st.plotly_chart(_yield_spread_history_chart(spread_history, primary_col), width='stretch')
         else:
             st.info("Spread history unavailable.")
 
@@ -799,7 +809,7 @@ def _render_yield_curve_panel(yield_curve: dict) -> None:
                 [{"spread": k, "bps": v} for k, v in current_spreads.items()]
             )
             spread_rows["bps"] = spread_rows["bps"].map(lambda x: f"{x:+.1f}")
-            st.dataframe(spread_rows, use_container_width=True, hide_index=True)
+            st.dataframe(spread_rows, width='stretch', hide_index=True)
 
     st.caption(yield_curve.get("front_end_note", ""))
 
@@ -812,11 +822,143 @@ def _render_yield_curve_panel(yield_curve: dict) -> None:
         st.markdown("**Treasury Futures Focus (ZT/ZN/ZB/UB)**")
         st.dataframe(
             show[["contract", "ticker", "last", "weekly_return", "monthly_return", "trend"]],
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
     else:
         st.info("Treasury futures table unavailable.")
+
+
+def _factor_basket_bar_chart(summary: pd.DataFrame, col: str, title: str) -> go.Figure:
+    if not isinstance(summary, pd.DataFrame) or summary.empty or col not in summary:
+        return go.Figure()
+
+    df = summary.dropna(subset=[col]).copy()
+    if df.empty:
+        return go.Figure()
+    df = df.sort_values(col, ascending=True)
+
+    colors = ["#42d680" if x >= 0 else "#ff6f6f" for x in df[col]]
+    fig = go.Figure(
+        go.Bar(
+            x=df[col] * 100,
+            y=df["basket"],
+            orientation="h",
+            marker=dict(color=colors),
+            text=[f"{x:+.2f}%" for x in df[col] * 100],
+            textposition="outside",
+            textfont=dict(color="#ffffff", size=12),
+        )
+    )
+    fig.update_layout(
+        title=title,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=0, r=20, t=35, b=10),
+        xaxis=dict(title="Return %", gridcolor="rgba(140,170,205,0.18)", zerolinecolor="rgba(140,170,205,0.25)"),
+        yaxis=dict(title=""),
+        font=dict(color="#ffffff", family="Space Grotesk"),
+        height=420,
+    )
+    return _apply_chart_theme(fig)
+
+
+def _factor_basket_history_chart(history: pd.DataFrame, basket_name: str) -> go.Figure:
+    if not isinstance(history, pd.DataFrame) or history.empty or "date" not in history or "basket_index" not in history:
+        return go.Figure()
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=history["date"],
+            y=history["basket_index"],
+            mode="lines",
+            name=f"{basket_name} Index",
+            line=dict(color="#66dca3", width=2.1),
+        )
+    )
+    if "rel_vs_spy" in history:
+        fig.add_trace(
+            go.Scatter(
+                x=history["date"],
+                y=history["rel_vs_spy"],
+                mode="lines",
+                name="Relative vs SPY",
+                line=dict(color="#7db3ff", width=1.9, dash="dot"),
+                yaxis="y2",
+            )
+        )
+
+    fig.update_layout(
+        title=f"{basket_name} Trend and Relative Performance",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=0, r=20, t=35, b=10),
+        xaxis=dict(gridcolor="rgba(140,170,205,0.18)"),
+        yaxis=dict(title="Basket Index", gridcolor="rgba(140,170,205,0.18)"),
+        yaxis2=dict(title="Relative vs SPY", overlaying="y", side="right", showgrid=False),
+        font=dict(color="#ffffff", family="Space Grotesk"),
+        height=320,
+    )
+    return _apply_chart_theme(fig)
+
+
+def _render_factor_basket_panel(factor_baskets: dict) -> None:
+    st.subheader("Sub-Factor Basket Rotation")
+
+    summary = factor_baskets.get("summary", pd.DataFrame())
+    if not isinstance(summary, pd.DataFrame) or summary.empty:
+        st.info("Sub-factor basket data unavailable.")
+        return
+
+    tab1, tab2, tab3 = st.tabs(["Daily", "Weekly", "Monthly"])
+    with tab1:
+        st.plotly_chart(_factor_basket_bar_chart(summary, "daily", "Sub-Factor Baskets (1D)"), width='stretch')
+    with tab2:
+        st.plotly_chart(_factor_basket_bar_chart(summary, "weekly", "Sub-Factor Baskets (1W)"), width='stretch')
+    with tab3:
+        st.plotly_chart(_factor_basket_bar_chart(summary, "monthly", "Sub-Factor Baskets (1M)"), width='stretch')
+
+    options = summary["basket"].astype(str).tolist()
+    selected = st.selectbox("Inspect basket holdings", options=options, key="factor_basket_select")
+
+    selected_row = summary[summary["basket"] == selected]
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        val = selected_row["daily"].iloc[0] if not selected_row.empty else np.nan
+        st.metric("Basket 1D", _format_pct(val) if pd.notna(val) else "n/a")
+    with c2:
+        val = selected_row["weekly"].iloc[0] if not selected_row.empty else np.nan
+        st.metric("Basket 1W", _format_pct(val) if pd.notna(val) else "n/a")
+    with c3:
+        val = selected_row["monthly"].iloc[0] if not selected_row.empty else np.nan
+        st.metric("Basket 1M", _format_pct(val) if pd.notna(val) else "n/a")
+    with c4:
+        avail = int(selected_row["holdings_available"].iloc[0]) if not selected_row.empty else 0
+        total = int(selected_row["holdings_total"].iloc[0]) if not selected_row.empty else 0
+        st.metric("Holdings Available", f"{avail}/{total}")
+
+    history_map = factor_baskets.get("history", {})
+    history = history_map.get(selected, pd.DataFrame()) if isinstance(history_map, dict) else pd.DataFrame()
+    if isinstance(history, pd.DataFrame) and not history.empty:
+        st.plotly_chart(_factor_basket_history_chart(history, selected), width='stretch')
+
+    holdings_map = factor_baskets.get("holdings", {})
+    holdings = holdings_map.get(selected, pd.DataFrame()) if isinstance(holdings_map, dict) else pd.DataFrame()
+
+    st.markdown(f"**{selected} Holdings**")
+    if isinstance(holdings, pd.DataFrame) and not holdings.empty:
+        show = holdings.copy()
+        for col in ["daily", "weekly", "monthly"]:
+            if col in show.columns:
+                show[col] = show[col].map(lambda x: f"{x * 100:+.2f}%" if pd.notna(x) else "n/a")
+        if "available" in show.columns:
+            show["available"] = show["available"].map(lambda x: "Yes" if bool(x) else "No")
+        st.dataframe(show[["ticker", "name", "daily", "weekly", "monthly", "available"]], width='stretch', hide_index=True)
+    else:
+        st.info("No holdings data for this basket.")
+
+    st.caption(str(factor_baskets.get("notes", "")))
 
 
 def _render_sector_panels(sectors: pd.DataFrame) -> None:
@@ -826,11 +968,11 @@ def _render_sector_panels(sectors: pd.DataFrame) -> None:
         return
     tab1, tab2, tab3 = st.tabs(["Daily", "Weekly", "Monthly"])
     with tab1:
-        st.plotly_chart(_sector_bar_chart(sectors, "daily", "Best / Worst Sectors (1D)"), use_container_width=True)
+        st.plotly_chart(_sector_bar_chart(sectors, "daily", "Best / Worst Sectors (1D)"), width='stretch')
     with tab2:
-        st.plotly_chart(_sector_bar_chart(sectors, "weekly", "Best / Worst Sectors (1W)"), use_container_width=True)
+        st.plotly_chart(_sector_bar_chart(sectors, "weekly", "Best / Worst Sectors (1W)"), width='stretch')
     with tab3:
-        st.plotly_chart(_sector_bar_chart(sectors, "monthly", "Best / Worst Sectors (1M)"), use_container_width=True)
+        st.plotly_chart(_sector_bar_chart(sectors, "monthly", "Best / Worst Sectors (1M)"), width='stretch')
 
 
 def _render_sentiment_panel(sentiment: dict) -> None:
@@ -838,7 +980,7 @@ def _render_sentiment_panel(sentiment: dict) -> None:
     score = float(sentiment.get("composite_score", 0))
     regime = sentiment.get("regime", "n/a")
 
-    st.plotly_chart(_gauge(score, f"Composite Sentiment ({regime})", -100, 100), use_container_width=True)
+    st.plotly_chart(_gauge(score, f"Composite Sentiment ({regime})", -100, 100), width='stretch')
     st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
 
     comps = sentiment.get("components", {})
@@ -881,7 +1023,7 @@ def _render_cta_panel(cta_proxy: dict) -> None:
     )
     c1, c2 = st.columns([1, 2])
     with c1:
-        st.plotly_chart(_gauge(float(cta_proxy.get("net_score", 0.0)), "Net CTA Proxy", -100, 100), use_container_width=True)
+        st.plotly_chart(_gauge(float(cta_proxy.get("net_score", 0.0)), "Net CTA Proxy", -100, 100), width='stretch')
     with c2:
         table = cta_proxy.get("table", pd.DataFrame()).copy()
         if table.empty:
@@ -892,7 +1034,7 @@ def _render_cta_panel(cta_proxy: dict) -> None:
             table["model_score"] = table["model_score"].map(lambda x: f"{x:+.1f}")
             st.dataframe(
                 table[["asset", "ticker", "stance", "strength_z", "model_score", "last"]],
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
             )
 
@@ -991,13 +1133,13 @@ def _render_liquidity_real_rate_panel(liquidity_monitor: dict) -> None:
     c1, c2 = st.columns([1, 1])
     with c1:
         if pd.notna(liq_score):
-            st.plotly_chart(_gauge(float(liq_score), "Liquidity Stress", 0, 100), use_container_width=True)
+            st.plotly_chart(_gauge(float(liq_score), "Liquidity Stress", 0, 100), width='stretch')
         else:
             st.info("Liquidity score unavailable.")
         st.markdown(f"**Liquidity Regime:** {liq_regime}")
     with c2:
         if pd.notna(real_z):
-            st.plotly_chart(_gauge(float(real_z), "Real-Rate Proxy (z)", -3, 3), use_container_width=True)
+            st.plotly_chart(_gauge(float(real_z), "Real-Rate Proxy (z)", -3, 3), width='stretch')
         else:
             st.info("Real-rate proxy unavailable.")
         st.markdown(f"**Real-Rate Regime:** {real_regime}")
@@ -1019,7 +1161,7 @@ def _render_liquidity_real_rate_panel(liquidity_monitor: dict) -> None:
 
     history = liquidity_monitor.get("history", pd.DataFrame())
     if isinstance(history, pd.DataFrame) and not history.empty:
-        st.plotly_chart(_liquidity_real_rate_history_chart(history), use_container_width=True)
+        st.plotly_chart(_liquidity_real_rate_history_chart(history), width='stretch')
     else:
         st.info("Liquidity/real-rate history unavailable.")
 
@@ -1043,7 +1185,7 @@ def _render_liquidity_real_rate_panel(liquidity_monitor: dict) -> None:
             return f"{float(val):+.3f}"
 
         show["value"] = show.apply(_fmt_metric, axis=1)
-        st.dataframe(show[["metric", "value", "signal"]], use_container_width=True, hide_index=True)
+        st.dataframe(show[["metric", "value", "signal"]], width='stretch', hide_index=True)
 
     st.caption(str(liquidity_monitor.get("notes", "")))
 
@@ -1064,13 +1206,13 @@ def _render_regime_panel(regime_engine: dict) -> None:
 
     scores = regime_engine.get("scores", {})
     if isinstance(scores, dict) and scores:
-        st.plotly_chart(_regime_scores_chart(scores), use_container_width=True)
+        st.plotly_chart(_regime_scores_chart(scores), width='stretch')
 
     components = regime_engine.get("components", pd.DataFrame())
     if isinstance(components, pd.DataFrame) and not components.empty:
         show = components.copy()
         show["value"] = show["value"].map(lambda x: f"{x:+.3f}" if pd.notna(x) else "n/a")
-        st.dataframe(show[["factor", "value", "signal"]], use_container_width=True, hide_index=True)
+        st.dataframe(show[["factor", "value", "signal"]], width='stretch', hide_index=True)
 
     st.caption(str(regime_engine.get("notes", "")))
 
@@ -1084,7 +1226,7 @@ def _render_cross_asset_panel(cross_asset: dict) -> None:
     c1, c2 = st.columns([1, 2])
     with c1:
         if pd.notna(ratio):
-            st.plotly_chart(_gauge(float(ratio * 100), "Confirmation", 0, 100, "%"), use_container_width=True)
+            st.plotly_chart(_gauge(float(ratio * 100), "Confirmation", 0, 100, "%"), width='stretch')
         else:
             st.info("Confirmation ratio unavailable.")
     with c2:
@@ -1116,7 +1258,7 @@ def _render_cross_asset_panel(cross_asset: dict) -> None:
         if "supports_bias" in show:
             cols.append("supports_bias")
 
-        st.dataframe(show[cols], use_container_width=True, hide_index=True)
+        st.dataframe(show[cols], width='stretch', hide_index=True)
 
 
 def _put_skew_chart(table: pd.DataFrame) -> go.Figure:
@@ -1175,7 +1317,7 @@ def _render_put_skew_panel(put_skew: dict) -> None:
 
     table = put_skew.get("table", pd.DataFrame())
     if isinstance(table, pd.DataFrame) and not table.empty:
-        st.plotly_chart(_put_skew_chart(table), use_container_width=True)
+        st.plotly_chart(_put_skew_chart(table), width='stretch')
 
         show = table.copy()
         if "spot" in show.columns:
@@ -1209,7 +1351,7 @@ def _render_put_skew_panel(put_skew: dict) -> None:
                     "status",
                 ]
             ],
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
     else:
@@ -1240,7 +1382,7 @@ def _render_event_risk_panel(event_risk: dict) -> None:
         show = events.copy()
         show["date"] = pd.to_datetime(show["date"], errors="coerce").dt.strftime("%Y-%m-%d")
         show["risk_contrib"] = show["risk_contrib"].map(lambda x: f"{x:.1f}")
-        st.dataframe(show[["event", "category", "date", "days_to_event", "risk_contrib"]].head(14), use_container_width=True, hide_index=True)
+        st.dataframe(show[["event", "category", "date", "days_to_event", "risk_contrib"]].head(14), width='stretch', hide_index=True)
 
     st.caption(str(event_risk.get("notes", "")))
 
@@ -1267,7 +1409,7 @@ def _render_watchlist_panel(watchlist: dict) -> None:
                 show[col] = show[col].map(lambda x: f"{x * 100:+.2f}%" if pd.notna(x) else "n/a")
         if "is_mover" in show:
             show["is_mover"] = show["is_mover"].map(lambda x: "Yes" if bool(x) else "No")
-        st.dataframe(show[["ticker", "label", "last", "daily", "weekly", "monthly", "is_mover"]].head(20), use_container_width=True, hide_index=True)
+        st.dataframe(show[["ticker", "label", "last", "daily", "weekly", "monthly", "is_mover"]].head(20), width='stretch', hide_index=True)
     else:
         st.info("Watchlist data unavailable.")
 
@@ -1340,7 +1482,7 @@ def _render_signal_quality_panel(signal_quality: dict) -> None:
 
     summary = signal_quality.get("summary", pd.DataFrame())
     if isinstance(summary, pd.DataFrame) and not summary.empty:
-        st.plotly_chart(_signal_quality_hit_chart(summary), use_container_width=True)
+        st.plotly_chart(_signal_quality_hit_chart(summary), width='stretch')
         show = summary.copy()
         for col in ["hit_rate_1d", "hit_rate_3d", "hit_rate_5d", "avg_aligned_5d", "avg_max_adverse_5d"]:
             if col in show:
@@ -1362,7 +1504,7 @@ def _render_signal_quality_panel(signal_quality: dict) -> None:
                     "avg_trigger_score",
                 ]
             ],
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
 
@@ -1391,7 +1533,7 @@ def _render_signal_quality_panel(signal_quality: dict) -> None:
                     "max_adverse_5d",
                 ]
             ].head(30),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
 
@@ -1443,7 +1585,7 @@ def _render_sector_flow_panel(sector_flow: dict) -> None:
     with c3:
         st.metric("Leader Turnover", f"{turnover * 100:.0f}%" if pd.notna(turnover) else "n/a")
 
-    st.plotly_chart(_sector_heatmap_chart(sector_flow), use_container_width=True)
+    st.plotly_chart(_sector_heatmap_chart(sector_flow), width='stretch')
 
     lt = sector_flow.get("leaders_today", pd.DataFrame())
     lp = sector_flow.get("leaders_prev", pd.DataFrame())
@@ -1453,7 +1595,7 @@ def _render_sector_flow_panel(sector_flow: dict) -> None:
         if isinstance(lt, pd.DataFrame) and not lt.empty:
             show = lt.copy()
             show["daily"] = show["daily"].map(lambda x: f"{x * 100:+.2f}%")
-            st.dataframe(show, use_container_width=True, hide_index=True)
+            st.dataframe(show, width='stretch', hide_index=True)
         else:
             st.info("Unavailable.")
     with col2:
@@ -1461,7 +1603,7 @@ def _render_sector_flow_panel(sector_flow: dict) -> None:
         if isinstance(lp, pd.DataFrame) and not lp.empty:
             show = lp.copy()
             show["daily"] = show["daily"].map(lambda x: f"{x * 100:+.2f}%")
-            st.dataframe(show, use_container_width=True, hide_index=True)
+            st.dataframe(show, width='stretch', hide_index=True)
         else:
             st.info("Unavailable.")
 
@@ -1500,7 +1642,7 @@ def _render_history_panel(history_df: pd.DataFrame) -> None:
         st.info("History will populate after a few refresh cycles.")
         return
 
-    st.plotly_chart(_history_chart(history_df), use_container_width=True)
+    st.plotly_chart(_history_chart(history_df), width='stretch')
     cols = st.columns(4)
     with cols[0]:
         avg_vol = history_df["volume_ratio"].dropna().mean() if "volume_ratio" in history_df else np.nan
@@ -1619,6 +1761,10 @@ def main() -> None:
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("<div class='panel'>", unsafe_allow_html=True)
+    _render_factor_basket_panel(payload.get("factor_baskets", {}))
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='panel'>", unsafe_allow_html=True)
     _render_yield_curve_panel(payload.get("yield_curve", {}))
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1650,3 +1796,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
