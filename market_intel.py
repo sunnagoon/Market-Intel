@@ -6,7 +6,12 @@ from datetime import date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import csv
+import io
+import json
 import os
+import time as time_module
+import urllib.request
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -105,6 +110,7 @@ DEFENSIVE_SECTOR_TICKERS = {"XLP", "XLU", "XLV", "XLRE"}
 
 CROSS_ASSET_EXTRA_TICKERS = {"LQD"}
 LIQUIDITY_MONITOR_TICKERS = {"TIP", "IEF", "HYG", "LQD", "UUP", "TLT", "SHY"}
+VOL_STRUCTURE_TICKERS = {"^VIX9D", "^VIX3M", "^VVIX", "^MOVE"}
 PUT_SKEW_UNDERLYINGS = ["SPY", "QQQ", "IWM"]
 
 FACTOR_BASKETS = {
@@ -145,6 +151,47 @@ FACTOR_BASKETS = {
     "Retail / Off-Price": ["TJX", "ROST", "BURL", "COST", "WMT"],
 }
 
+INDEX_CONSTITUENT_SOURCES = {
+    "sp500": {
+        "label": "S&P 500",
+        "benchmark": "^GSPC",
+        "source": "ishares",
+        "url": "https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf/1467271812596.ajax?fileType=csv&fileName=IVV_holdings",
+        "default_max": 500,
+    },
+    "russell2000": {
+        "label": "Russell 2000",
+        "benchmark": "^RUT",
+        "source": "ishares",
+        "url": "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings",
+        "default_max": 1200,
+    },
+    "nasdaq100": {
+        "label": "Nasdaq 100",
+        "benchmark": "QQQ",
+        "source": "nasdaq_api",
+        "url": "https://api.nasdaq.com/api/quote/list-type/nasdaq100",
+        "default_max": 101,
+    },
+}
+
+BASE_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MarketIntel/1.0",
+}
+
+NASDAQ_API_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MarketIntel/1.0",
+    "Accept": "application/json, text/plain, */*",
+    "Origin": "https://www.nasdaq.com",
+    "Referer": "https://www.nasdaq.com/",
+}
+
+_INDEX_UNIVERSE_CACHE: dict[str, tuple[datetime, list[dict[str, str]]]] = {}
+_NEAR_LOW_SCREENER_CACHE: dict[str, Any] = {"timestamp": None, "data": None}
+
+ISHARES_TICKER_OVERRIDES = {"BRKB": "BRK-B", "BFB": "BF-B", "MOGA": "MOG-A", "MOGB": "MOG-B"}
+
+
 DEFAULT_WATCHLIST = ["SPY", "QQQ", "IWM", "TLT", "UUP", "GLD", "HYG", "LQD", "XLF", "XLK"]
 
 FOMC_CALENDAR = {
@@ -169,11 +216,37 @@ class SessionProgress:
     label: str
 
 
-def _download_batch(
-    tickers: list[str], period: str = "6mo", interval: str = "1d", prepost: bool = False
+def _chunked(seq: list[str], size: int) -> list[list[str]]:
+    size = max(1, int(size))
+    return [seq[i : i + size] for i in range(0, len(seq), size)]
+
+
+def _normalize_download_frame(data: pd.DataFrame, requested_tickers: list[str]) -> pd.DataFrame:
+    if data.empty:
+        return pd.DataFrame()
+
+    out = data.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        return out.dropna(how="all")
+
+    ticker = requested_tickers[0] if requested_tickers else ""
+    if not ticker:
+        return out.dropna(how="all")
+
+    out.columns = pd.MultiIndex.from_product([[ticker], out.columns])
+    return out.dropna(how="all")
+
+
+def _download_once(
+    tickers: list[str],
+    period: str,
+    interval: str,
+    prepost: bool,
+    timeout_sec: float,
 ) -> pd.DataFrame:
     if not tickers:
         return pd.DataFrame()
+
     try:
         data = yf.download(
             " ".join(tickers),
@@ -181,15 +254,79 @@ def _download_batch(
             interval=interval,
             auto_adjust=False,
             group_by="ticker",
-            threads=True,
+            threads=False,
             progress=False,
             prepost=prepost,
+            timeout=timeout_sec,
         )
     except Exception:
         return pd.DataFrame()
+
+    return _normalize_download_frame(data, tickers)
+
+
+def _download_batch(
+    tickers: list[str], period: str = "6mo", interval: str = "1d", prepost: bool = False
+) -> pd.DataFrame:
+    if not tickers:
+        return pd.DataFrame()
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in tickers:
+        t = str(raw).strip().upper()
+        if t and t not in seen:
+            seen.add(t)
+            cleaned.append(t)
+
+    if not cleaned:
+        return pd.DataFrame()
+
+    chunk_size = max(1, int(os.getenv("YF_DOWNLOAD_CHUNK_SIZE", "24")))
+    retries = max(0, int(os.getenv("YF_DOWNLOAD_RETRIES", "2")))
+    timeout_sec = float(os.getenv("YF_DOWNLOAD_TIMEOUT_SEC", "20"))
+    retry_delay = max(0.0, float(os.getenv("YF_DOWNLOAD_RETRY_DELAY_SEC", "0.45")))
+
+    frames: list[pd.DataFrame] = []
+
+    for chunk in _chunked(cleaned, chunk_size):
+        chunk_frame = pd.DataFrame()
+        for attempt in range(retries + 1):
+            chunk_frame = _download_once(chunk, period, interval, prepost, timeout_sec)
+            if not chunk_frame.empty:
+                break
+            if attempt < retries and retry_delay > 0:
+                time_module.sleep(retry_delay * (attempt + 1))
+
+        missing = list(chunk)
+        if not chunk_frame.empty:
+            frames.append(chunk_frame)
+            available = set(chunk_frame.columns.get_level_values(0)) if isinstance(chunk_frame.columns, pd.MultiIndex) else set()
+            missing = [t for t in chunk if t not in available]
+
+        # Retry missing names as single-symbol requests so one timeout doesn't drop whole chunk.
+        for ticker in missing:
+            single = pd.DataFrame()
+            for attempt in range(retries + 1):
+                single = _download_once([ticker], period, interval, prepost, timeout_sec)
+                if not single.empty:
+                    break
+                if attempt < retries and retry_delay > 0:
+                    time_module.sleep(retry_delay * (attempt + 1))
+            if not single.empty:
+                frames.append(single)
+
+    if not frames:
+        return pd.DataFrame()
+
+    data = pd.concat(frames, axis=1)
+    if isinstance(data.columns, pd.MultiIndex):
+        data = data.loc[:, ~data.columns.duplicated()]
+
     if isinstance(data.index, pd.DatetimeIndex) and data.index.tz is not None:
         data.index = data.index.tz_convert(US_EASTERN).tz_localize(None)
-    return data
+
+    return data.sort_index()
 
 
 def _extract_ticker_frame(data: pd.DataFrame, ticker: str) -> pd.DataFrame:
@@ -308,6 +445,7 @@ def _build_factor_baskets(daily_data: pd.DataFrame) -> dict[str, Any]:
         basket_daily = np.nan
         basket_weekly = np.nan
         basket_monthly = np.nan
+        basket_prev_daily = np.nan
         rel_daily = np.nan
         rel_weekly = np.nan
         rel_monthly = np.nan
@@ -323,6 +461,9 @@ def _build_factor_baskets(daily_data: pd.DataFrame) -> dict[str, Any]:
                 basket_daily = _safe_return(basket_index, 1)
                 basket_weekly = _safe_return(basket_index, 5)
                 basket_monthly = _safe_return(basket_index, 21)
+                ret_1d = basket_index.pct_change(fill_method=None)
+                if len(ret_1d.dropna()) >= 2:
+                    basket_prev_daily = float(ret_1d.dropna().iloc[-2])
 
                 rel_daily = basket_daily - spy_daily if pd.notna(basket_daily) and pd.notna(spy_daily) else np.nan
                 rel_weekly = basket_weekly - spy_weekly if pd.notna(basket_weekly) and pd.notna(spy_weekly) else np.nan
@@ -343,6 +484,7 @@ def _build_factor_baskets(daily_data: pd.DataFrame) -> dict[str, Any]:
             {
                 "basket": basket_name,
                 "daily": basket_daily,
+                "prev_daily": basket_prev_daily,
                 "weekly": basket_weekly,
                 "monthly": basket_monthly,
                 "rel_vs_spy_daily": rel_daily,
@@ -362,10 +504,20 @@ def _build_factor_baskets(daily_data: pd.DataFrame) -> dict[str, Any]:
     if not summary.empty:
         summary = summary.sort_values("daily", ascending=False, na_position="last").reset_index(drop=True)
 
+    top_today_list: list[str] = []
+    top_prev_list: list[str] = []
+    if not summary.empty:
+        today_rank = summary.dropna(subset=["daily"]).sort_values("daily", ascending=False)
+        prev_rank = summary.dropna(subset=["prev_daily"]).sort_values("prev_daily", ascending=False)
+        top_today_list = today_rank["basket"].astype(str).head(5).tolist()
+        top_prev_list = prev_rank["basket"].astype(str).head(5).tolist()
+
     return {
         "summary": summary,
         "holdings": holdings_map,
         "history": history_map,
+        "top_today_list": top_today_list,
+        "top_prev_list": top_prev_list,
         "notes": "Baskets are equal-weight custom sleeves. Click/select a basket to inspect holdings and relative trend.",
     }
 
@@ -1450,6 +1602,328 @@ def _build_watchlist_monitor(daily_data: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+
+def _normalize_symbol_for_yf(symbol: str) -> str:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return ""
+    sym = sym.replace(".", "-").replace("/", "-")
+    if sym in {"-", "N/A", "NA", "NONE"}:
+        return ""
+    if len(sym) > 10 or not any(ch.isalpha() for ch in sym):
+        return ""
+    return sym
+
+
+def _http_get_text(url: str, timeout: float = 20.0, retries: int = 2) -> str:
+    if not url:
+        return ""
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            headers = NASDAQ_API_HEADERS if "api.nasdaq.com" in url else BASE_HTTP_HEADERS
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", "ignore")
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                time_module.sleep(0.35 * (attempt + 1))
+    return ""
+
+
+def _parse_ishares_holdings(text: str, max_count: int) -> list[dict[str, str]]:
+    if not text:
+        return []
+    start = text.find("Ticker,Name,")
+    if start < 0:
+        return []
+
+    reader = csv.DictReader(io.StringIO(text[start:]))
+    rows: list[dict[str, Any]] = []
+    for row in reader:
+        ticker = _normalize_symbol_for_yf(row.get("Ticker", ""))
+        ticker = ISHARES_TICKER_OVERRIDES.get(ticker, ticker)
+        name = str(row.get("Name", "") or "").strip()
+        asset_class = str(row.get("Asset Class", "") or "").strip().lower()
+        name_upper = name.upper()
+        if not ticker or not name:
+            continue
+        if asset_class and asset_class not in {"equity", "stock"}:
+            continue
+        if ticker.startswith("X") and len(ticker) >= 5:
+            continue
+        if any(tok in name_upper for tok in ["FUTURE", "SWAP", "FORWARD", "CASH COLLATERAL"]):
+            continue
+        if "TOTAL" in name_upper or name == "-":
+            continue
+        weight = pd.to_numeric(row.get("Weight (%)", np.nan), errors="coerce")
+        rows.append(
+            {
+                "ticker": ticker,
+                "name": name,
+                "weight": float(weight) if pd.notna(weight) else np.nan,
+            }
+        )
+
+    if not rows:
+        return []
+
+    df = pd.DataFrame(rows)
+    if "weight" in df.columns:
+        df = df.sort_values("weight", ascending=False, na_position="last")
+    df = df.drop_duplicates(subset=["ticker"], keep="first").reset_index(drop=True)
+    if max_count > 0:
+        df = df.head(max_count)
+    return df[["ticker", "name"]].to_dict("records")
+
+
+def _fetch_nasdaq100_constituents(url: str, max_count: int) -> list[dict[str, str]]:
+    payload = _http_get_text(url, timeout=20.0, retries=2)
+    if not payload:
+        return []
+
+    try:
+        parsed = json.loads(payload)
+    except Exception:
+        return []
+
+    rows = (((parsed.get("data") or {}).get("data") or {}).get("rows") or [])
+    out: list[dict[str, str]] = []
+    for row in rows:
+        ticker = _normalize_symbol_for_yf(row.get("symbol", ""))
+        name = str(row.get("companyName", "") or "").strip()
+        if not ticker:
+            continue
+        out.append({"ticker": ticker, "name": name or ticker})
+
+    if not out:
+        return []
+
+    df = pd.DataFrame(out).drop_duplicates(subset=["ticker"], keep="first")
+    if max_count > 0:
+        df = df.head(max_count)
+    return df[["ticker", "name"]].to_dict("records")
+
+
+def _load_index_constituents(index_key: str, max_count: int) -> list[dict[str, str]]:
+    cfg = INDEX_CONSTITUENT_SOURCES.get(index_key, {})
+    if not cfg:
+        return []
+
+    ttl_sec = max(600, int(os.getenv("INDEX_UNIVERSE_TTL_SEC", "21600")))
+    cache_key = f"{index_key}:{max_count}"
+    now = datetime.now(US_EASTERN)
+    cached = _INDEX_UNIVERSE_CACHE.get(cache_key)
+    if cached:
+        ts, records = cached
+        if (now - ts).total_seconds() <= ttl_sec and records:
+            return records
+
+    source = str(cfg.get("source", ""))
+    url = str(cfg.get("url", ""))
+    records: list[dict[str, str]] = []
+
+    if source == "ishares":
+        text = _http_get_text(url, timeout=25.0, retries=2)
+        records = _parse_ishares_holdings(text, max_count=max_count)
+    elif source == "nasdaq_api":
+        records = _fetch_nasdaq100_constituents(url, max_count=max_count)
+
+    if records:
+        _INDEX_UNIVERSE_CACHE[cache_key] = (now, records)
+    return records
+
+
+def _build_near_52w_low_index_screen(
+    index_key: str,
+    index_label: str,
+    benchmark_ticker: str,
+    constituents: list[dict[str, str]],
+    universe_prices: pd.DataFrame,
+    benchmark_close: pd.Series,
+    top_n: int,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    bench = benchmark_close.dropna()
+    bench_1m = _safe_return(bench, 21) if len(bench) > 30 else np.nan
+    bench_3m = _safe_return(bench, 63) if len(bench) > 70 else np.nan
+
+    rows: list[dict[str, Any]] = []
+    scanned = 0
+
+    for item in constituents:
+        ticker = str(item.get("ticker", "") or "").strip().upper()
+        if not ticker:
+            continue
+
+        frame = _extract_ticker_frame(universe_prices, ticker)
+        if frame.empty or "Close" not in frame:
+            continue
+
+        close = pd.to_numeric(frame["Close"], errors="coerce").dropna()
+        if len(close) < 260:
+            continue
+
+        scanned += 1
+        last = float(close.iloc[-1])
+        low_52w = float(close.tail(252).min())
+        if not np.isfinite(last) or not np.isfinite(low_52w) or last <= 0 or low_52w <= 0:
+            continue
+
+        dist_to_low = (last / low_52w) - 1.0
+        if dist_to_low < -0.02 or dist_to_low > 0.35:
+            continue
+        within_band = bool(dist_to_low <= 0.10)
+
+        ret_5d = _safe_return(close, 5)
+        ret_1m = _safe_return(close, 21)
+        ret_3m = _safe_return(close, 63)
+
+        rs_1m = ret_1m - bench_1m if pd.notna(ret_1m) and pd.notna(bench_1m) else np.nan
+        rs_3m = ret_3m - bench_3m if pd.notna(ret_3m) and pd.notna(bench_3m) else np.nan
+
+        momentum_ok = bool(pd.notna(ret_1m) and ret_1m > 0)
+        rs_ok = bool(pd.notna(rs_1m) and rs_1m > 0)
+        strict_match = bool(momentum_ok and rs_ok)
+
+        proximity_score = float(np.clip((0.10 - max(dist_to_low, 0.0)) / 0.10, 0.0, 1.0))
+        rs_score = float(np.clip(((max(rs_1m if pd.notna(rs_1m) else 0.0, 0.0) + max(rs_3m if pd.notna(rs_3m) else 0.0, 0.0)) / 0.30), 0.0, 1.0))
+        mom_score = float(np.clip(((max(ret_5d if pd.notna(ret_5d) else 0.0, 0.0) + max(ret_1m if pd.notna(ret_1m) else 0.0, 0.0)) / 0.20), 0.0, 1.0))
+        score = 100.0 * (0.45 * proximity_score + 0.35 * rs_score + 0.20 * mom_score)
+
+        rows.append(
+            {
+                "index_key": index_key,
+                "index": index_label,
+                "ticker": ticker,
+                "name": str(item.get("name", ticker) or ticker),
+                "last": last,
+                "distance_to_52w_low": dist_to_low,
+                "ret_5d": ret_5d,
+                "ret_1m": ret_1m,
+                "ret_3m": ret_3m,
+                "rs_1m": rs_1m,
+                "rs_3m": rs_3m,
+                "within_10pct_band": within_band,
+                "strict_match": strict_match,
+                "score": float(score),
+            }
+        )
+
+    df_all = pd.DataFrame(rows)
+    strict_count = 0
+    used_relaxed = False
+    used_broad = False
+
+    if df_all.empty:
+        df = df_all
+    else:
+        strict_df = df_all[(df_all["strict_match"]) & (df_all["within_10pct_band"])].copy()
+        strict_count = int(len(strict_df))
+
+        if not strict_df.empty:
+            ranked_source = strict_df
+        else:
+            near_band = df_all[df_all["within_10pct_band"]].copy()
+            if not near_band.empty:
+                ranked_source = near_band
+                used_relaxed = True
+            else:
+                ranked_source = df_all.copy()
+                used_relaxed = True
+                used_broad = True
+
+        df = ranked_source.sort_values(["score", "distance_to_52w_low"], ascending=[False, True]).reset_index(drop=True)
+        if top_n > 0:
+            df = df.head(top_n).reset_index(drop=True)
+
+    summary = {
+        "index_key": index_key,
+        "index": index_label,
+        "benchmark": benchmark_ticker,
+        "universe_size": int(len(constituents)),
+        "scanned": int(scanned),
+        "qualified": int(len(df)),
+        "strict_qualified": int(strict_count),
+        "used_relaxed": bool(used_relaxed),
+        "used_broad": bool(used_broad),
+        "benchmark_ret_1m": bench_1m,
+        "benchmark_ret_3m": bench_3m,
+    }
+    return df, summary
+
+
+def _build_near_52w_low_screener(daily_data: pd.DataFrame) -> dict[str, Any]:
+    ttl_sec = max(600, int(os.getenv("NEAR_LOW_SCREENER_TTL_SEC", "1800")))
+    now = datetime.now(US_EASTERN)
+    cached_ts = _NEAR_LOW_SCREENER_CACHE.get("timestamp")
+    cached_data = _NEAR_LOW_SCREENER_CACHE.get("data")
+    if isinstance(cached_ts, datetime) and cached_data:
+        if (now - cached_ts).total_seconds() <= ttl_sec:
+            return cached_data
+
+    top_n = max(1, min(30, int(os.getenv("NEAR_LOW_TOP_N", "10"))))
+
+    limits = {
+        "sp500": max(100, int(os.getenv("SP500_SCREEN_UNIVERSE_MAX", str(INDEX_CONSTITUENT_SOURCES["sp500"]["default_max"])))),
+        "russell2000": max(200, int(os.getenv("RUSSELL2000_SCREEN_UNIVERSE_MAX", str(INDEX_CONSTITUENT_SOURCES["russell2000"]["default_max"])))),
+        "nasdaq100": max(50, int(os.getenv("NASDAQ100_SCREEN_UNIVERSE_MAX", str(INDEX_CONSTITUENT_SOURCES["nasdaq100"]["default_max"])))),
+    }
+
+    universe_map: dict[str, list[dict[str, str]]] = {}
+    all_symbols: set[str] = set()
+    notes: list[str] = []
+
+    for key, cfg in INDEX_CONSTITUENT_SOURCES.items():
+        members = _load_index_constituents(key, max_count=limits.get(key, int(cfg.get("default_max", 0))))
+        universe_map[key] = members
+        all_symbols.update([m["ticker"] for m in members if m.get("ticker")])
+        if not members:
+            notes.append(f"{cfg.get('label', key)} constituents unavailable from source feed.")
+
+    universe_prices = _download_batch(sorted(all_symbols), period="14mo", interval="1d") if all_symbols else pd.DataFrame()
+
+    results: dict[str, pd.DataFrame] = {}
+    summaries: list[dict[str, Any]] = []
+
+    for key, cfg in INDEX_CONSTITUENT_SOURCES.items():
+        benchmark = str(cfg.get("benchmark", ""))
+        benchmark_frame = _extract_ticker_frame(daily_data, benchmark)
+        benchmark_close = benchmark_frame["Close"].dropna() if not benchmark_frame.empty and "Close" in benchmark_frame else pd.Series(dtype=float)
+
+        table, summary = _build_near_52w_low_index_screen(
+            index_key=key,
+            index_label=str(cfg.get("label", key)),
+            benchmark_ticker=benchmark,
+            constituents=universe_map.get(key, []),
+            universe_prices=universe_prices,
+            benchmark_close=benchmark_close,
+            top_n=top_n,
+        )
+        results[key] = table
+        summaries.append(summary)
+
+    coverage = pd.DataFrame(summaries)
+    payload = {
+        "updated_at": now,
+        "top_n": top_n,
+        "index_labels": {k: str(v.get("label", k)) for k, v in INDEX_CONSTITUENT_SOURCES.items()},
+        "results": results,
+        "coverage": coverage,
+        "notes": "Candidates are within 10% of 52-week lows, with positive short-term momentum and positive 1M relative strength vs index benchmark."
+        + (" " + " ".join(notes) if notes else ""),
+    }
+
+    _NEAR_LOW_SCREENER_CACHE["timestamp"] = now
+    _NEAR_LOW_SCREENER_CACHE["data"] = payload
+    return payload
+
+
+def build_near_52w_low_screener_payload() -> dict[str, Any]:
+    benchmark_tickers = sorted({str(cfg.get("benchmark", "")).strip().upper() for cfg in INDEX_CONSTITUENT_SOURCES.values() if cfg.get("benchmark")})
+    benchmark_data = _download_batch(benchmark_tickers, period="14mo", interval="1d") if benchmark_tickers else pd.DataFrame()
+    return _build_near_52w_low_screener(benchmark_data)
+
 def _build_sector_heatmap_flow(daily_data: pd.DataFrame, sector_returns: pd.DataFrame) -> dict[str, Any]:
     if sector_returns.empty:
         return {
@@ -1460,6 +1934,10 @@ def _build_sector_heatmap_flow(daily_data: pd.DataFrame, sector_returns: pd.Data
             "dispersion": np.nan,
             "leaders_today": pd.DataFrame(),
             "leaders_prev": pd.DataFrame(),
+            "ranking_today": pd.DataFrame(),
+            "ranking_prev": pd.DataFrame(),
+            "top_today_list": [],
+            "top_prev_list": [],
             "notes": "Sector flow model unavailable.",
         }
 
@@ -1482,6 +1960,10 @@ def _build_sector_heatmap_flow(daily_data: pd.DataFrame, sector_returns: pd.Data
             "dispersion": np.nan,
             "leaders_today": pd.DataFrame(),
             "leaders_prev": pd.DataFrame(),
+            "ranking_today": pd.DataFrame(),
+            "ranking_prev": pd.DataFrame(),
+            "top_today_list": [],
+            "top_prev_list": [],
             "notes": "Not enough sector return history for flow shift model.",
         }
 
@@ -1495,6 +1977,10 @@ def _build_sector_heatmap_flow(daily_data: pd.DataFrame, sector_returns: pd.Data
             "dispersion": np.nan,
             "leaders_today": pd.DataFrame(),
             "leaders_prev": pd.DataFrame(),
+            "ranking_today": pd.DataFrame(),
+            "ranking_prev": pd.DataFrame(),
+            "top_today_list": [],
+            "top_prev_list": [],
             "notes": "Not enough sector return history for flow shift model.",
         }
 
@@ -1519,6 +2005,13 @@ def _build_sector_heatmap_flow(daily_data: pd.DataFrame, sector_returns: pd.Data
 
     leaders_today = pd.DataFrame({"sector": today.head(3).index, "daily": today.head(3).values})
     leaders_prev = pd.DataFrame({"sector": prev.head(3).index, "daily": prev.head(3).values})
+    ranking_today = pd.DataFrame({"sector": today.index, "daily": today.values})
+    ranking_today["rank"] = np.arange(1, len(ranking_today) + 1)
+    ranking_prev = pd.DataFrame({"sector": prev.index, "daily": prev.values})
+    ranking_prev["rank"] = np.arange(1, len(ranking_prev) + 1)
+
+    top_today_list = ranking_today["sector"].astype(str).head(5).tolist()
+    top_prev_list = ranking_prev["sector"].astype(str).head(5).tolist()
 
     return {
         "heatmap_table": heatmap.sort_values("daily", ascending=False).reset_index(drop=True),
@@ -1528,7 +2021,99 @@ def _build_sector_heatmap_flow(daily_data: pd.DataFrame, sector_returns: pd.Data
         "dispersion": dispersion,
         "leaders_today": leaders_today,
         "leaders_prev": leaders_prev,
+        "ranking_today": ranking_today,
+        "ranking_prev": ranking_prev,
+        "top_today_list": top_today_list,
+        "top_prev_list": top_prev_list,
         "notes": "Flow shift combines top-sector turnover and cross-sector return dispersion.",
+    }
+
+
+def _build_rotation_flow_edges(prev_list: list[str], today_list: list[str], top_n: int = 5) -> pd.DataFrame:
+    prev_clean = [str(x) for x in prev_list if str(x).strip()][:top_n]
+    today_clean = [str(x) for x in today_list if str(x).strip()][:top_n]
+
+    prev_rank = {name: i + 1 for i, name in enumerate(prev_clean)}
+    today_rank = {name: i + 1 for i, name in enumerate(today_clean)}
+
+    rows: list[dict[str, Any]] = []
+    for name in prev_clean:
+        if name in today_rank:
+            rows.append(
+                {
+                    "source_node": f"Prev: {name}",
+                    "target_node": f"Today: {name}",
+                    "source": name,
+                    "target": name,
+                    "status": "Retained",
+                    "prev_rank": prev_rank.get(name, np.nan),
+                    "today_rank": today_rank.get(name, np.nan),
+                    "rank_change": int(today_rank[name] - prev_rank[name]),
+                    "weight": 1.0,
+                }
+            )
+        else:
+            rows.append(
+                {
+                    "source_node": f"Prev: {name}",
+                    "target_node": "Today: Other / Rest",
+                    "source": name,
+                    "target": "Other / Rest",
+                    "status": "Dropped",
+                    "prev_rank": prev_rank.get(name, np.nan),
+                    "today_rank": np.nan,
+                    "rank_change": np.nan,
+                    "weight": 1.0,
+                }
+            )
+
+    for name in today_clean:
+        if name not in prev_rank:
+            rows.append(
+                {
+                    "source_node": "Prev: Other / Rest",
+                    "target_node": f"Today: {name}",
+                    "source": "Other / Rest",
+                    "target": name,
+                    "status": "New",
+                    "prev_rank": np.nan,
+                    "today_rank": today_rank.get(name, np.nan),
+                    "rank_change": np.nan,
+                    "weight": 1.0,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def _build_rotation_flow_map(sector_flow: dict[str, Any], factor_baskets: dict[str, Any]) -> dict[str, Any]:
+    sector_prev = sector_flow.get("top_prev_list", []) if isinstance(sector_flow, dict) else []
+    sector_today = sector_flow.get("top_today_list", []) if isinstance(sector_flow, dict) else []
+    factor_prev = factor_baskets.get("top_prev_list", []) if isinstance(factor_baskets, dict) else []
+    factor_today = factor_baskets.get("top_today_list", []) if isinstance(factor_baskets, dict) else []
+
+    sector_edges = _build_rotation_flow_edges(list(sector_prev), list(sector_today), top_n=5)
+    factor_edges = _build_rotation_flow_edges(list(factor_prev), list(factor_today), top_n=6)
+
+    def _turnover(prev_list: list[str], today_list: list[str]) -> float:
+        a = [str(x) for x in prev_list if str(x).strip()]
+        b = [str(x) for x in today_list if str(x).strip()]
+        top_n = min(len(a), len(b))
+        if top_n <= 0:
+            return np.nan
+        overlap = len(set(a[:top_n]).intersection(set(b[:top_n])))
+        return float(1.0 - overlap / top_n)
+
+    return {
+        "sector_edges": sector_edges,
+        "factor_edges": factor_edges,
+        "sector_top_prev": list(sector_prev),
+        "sector_top_today": list(sector_today),
+        "factor_top_prev": list(factor_prev),
+        "factor_top_today": list(factor_today),
+        "sector_turnover": _turnover(list(sector_prev), list(sector_today)),
+        "factor_turnover": _turnover(list(factor_prev), list(factor_today)),
+        "notes": "Flow map compares prior leaders vs current leaders. New leaders route in from 'Other / Rest'; dropouts route out.",
     }
 
 
@@ -1915,6 +2500,144 @@ def _build_liquidity_real_rate_monitor(
         "details_table": details,
         "history": history.tail(220).reset_index(drop=True),
         "notes": "Real-rate signal is a proxy: 10Y nominal yield z-score minus TIP/IEF breakeven proxy z-score.",
+    }
+
+
+def _build_volatility_structure_module(daily_data: pd.DataFrame, snapshot: dict[str, dict[str, float]]) -> dict[str, Any]:
+    def _close(ticker: str) -> pd.Series:
+        frame = _extract_ticker_frame(daily_data, ticker)
+        if frame.empty or "Close" not in frame:
+            return pd.Series(dtype=float)
+        return pd.to_numeric(frame["Close"], errors="coerce").dropna()
+
+    vix9d = _close("^VIX9D")
+    vix = _close("^VIX")
+    vix3m = _close("^VIX3M")
+    vvix = _close("^VVIX")
+    move = _close("^MOVE")
+
+    index_parts = [s.index for s in [vix9d, vix, vix3m, vvix, move] if not s.empty]
+    if not index_parts:
+        vix_last = snapshot.get("^VIX", {}).get("last", np.nan)
+        return {
+            "structure_regime": "Unavailable",
+            "stress_regime": "Unavailable",
+            "front_spread": np.nan,
+            "slope_spread": np.nan,
+            "curve_ratio": np.nan,
+            "vix_level": vix_last if pd.notna(vix_last) else np.nan,
+            "vix9d_level": np.nan,
+            "vix3m_level": np.nan,
+            "vvix_level": np.nan,
+            "move_level": np.nan,
+            "stress_score": np.nan,
+            "daily_slope_delta": np.nan,
+            "week_slope_delta": np.nan,
+            "month_slope_delta": np.nan,
+            "week_trend": "Unavailable",
+            "month_trend": "Unavailable",
+            "history": pd.DataFrame(),
+            "notes": "Volatility structure data unavailable from feed.",
+        }
+
+    idx = index_parts[0]
+    for part in index_parts[1:]:
+        idx = idx.union(part)
+
+    hist = pd.DataFrame(index=idx.sort_values())
+    hist["vix9d"] = vix9d.reindex(hist.index)
+    hist["vix"] = vix.reindex(hist.index)
+    hist["vix3m"] = vix3m.reindex(hist.index)
+    hist["vvix"] = vvix.reindex(hist.index)
+    hist["move"] = move.reindex(hist.index)
+    hist["front_spread"] = hist["vix9d"] - hist["vix"]
+    hist["slope_spread"] = hist["vix"] - hist["vix3m"]
+    hist["curve_ratio"] = (hist["vix"] / hist["vix3m"]).replace([np.inf, -np.inf], np.nan)
+
+    def _last(series: pd.Series) -> float:
+        clean = series.dropna()
+        return float(clean.iloc[-1]) if not clean.empty else np.nan
+
+    vix9d_now = _last(hist["vix9d"])
+    vix_now = _last(hist["vix"])
+    vix3m_now = _last(hist["vix3m"])
+    vvix_now = _last(hist["vvix"])
+    move_now = _last(hist["move"])
+    front_now = _last(hist["front_spread"])
+    slope_now = _last(hist["slope_spread"])
+    ratio_now = _last(hist["curve_ratio"])
+
+    slope_series = hist["slope_spread"].dropna()
+    day_delta = float(slope_series.iloc[-1] - slope_series.iloc[-2]) if len(slope_series) > 1 else np.nan
+    week_delta = float(slope_series.iloc[-1] - slope_series.iloc[-6]) if len(slope_series) > 5 else np.nan
+    month_delta = float(slope_series.iloc[-1] - slope_series.iloc[-22]) if len(slope_series) > 21 else np.nan
+
+    def _term_trend(delta: float) -> str:
+        if pd.isna(delta):
+            return "Unavailable"
+        if delta >= 1.0:
+            return "Steepening into backwardation"
+        if delta <= -1.0:
+            return "Steepening into contango"
+        return "Mostly stable"
+
+    if pd.isna(slope_now):
+        structure_regime = "Unavailable"
+    elif slope_now >= 2.0:
+        structure_regime = "Backwardation (risk-off stress)"
+    elif slope_now >= 0.5:
+        structure_regime = "Flat / mild backwardation"
+    elif slope_now <= -2.0:
+        structure_regime = "Deep contango (risk-on calm)"
+    elif slope_now <= -0.5:
+        structure_regime = "Contango (normal carry)"
+    else:
+        structure_regime = "Flat term structure"
+
+    vix_comp = np.clip((vix_now - 16.0) / 14.0, 0, 1) if pd.notna(vix_now) else np.nan
+    vvix_comp = np.clip((vvix_now - 95.0) / 45.0, 0, 1) if pd.notna(vvix_now) else np.nan
+    move_comp = np.clip((move_now - 105.0) / 90.0, 0, 1) if pd.notna(move_now) else np.nan
+    slope_comp = np.clip((slope_now + 0.5) / 3.0, 0, 1) if pd.notna(slope_now) else np.nan
+
+    parts = [vix_comp, vvix_comp, move_comp, slope_comp]
+    weights = [0.40, 0.24, 0.21, 0.15]
+    valid = [(v, w) for v, w in zip(parts, weights) if pd.notna(v)]
+    stress_score = np.nan
+    if valid:
+        weight_sum = sum(w for _, w in valid)
+        stress_score = float(100.0 * sum(v * w for v, w in valid) / weight_sum)
+
+    if pd.isna(stress_score):
+        stress_regime = "Unavailable"
+    elif stress_score >= 70:
+        stress_regime = "High vol-of-vol stress"
+    elif stress_score >= 50:
+        stress_regime = "Elevated volatility stress"
+    elif stress_score >= 32:
+        stress_regime = "Neutral volatility backdrop"
+    else:
+        stress_regime = "Calm volatility backdrop"
+
+    out_hist = hist.reset_index().rename(columns={"index": "date"})
+    return {
+        "structure_regime": structure_regime,
+        "stress_regime": stress_regime,
+        "front_spread": front_now,
+        "slope_spread": slope_now,
+        "curve_ratio": ratio_now,
+        "vix_level": vix_now,
+        "vix9d_level": vix9d_now,
+        "vix3m_level": vix3m_now,
+        "vvix_level": vvix_now,
+        "move_level": move_now,
+        "stress_score": stress_score,
+        "daily_slope_delta": day_delta,
+        "week_slope_delta": week_delta,
+        "month_slope_delta": month_delta,
+        "week_trend": _term_trend(week_delta),
+        "month_trend": _term_trend(month_delta),
+        "history": out_hist.tail(220).reset_index(drop=True),
+        "notes": "Term structure uses VIX9D, VIX, and VIX3M. Positive VIX-VIX3M spread indicates backwardation (stress).",
     }
 
 
@@ -2704,6 +3427,7 @@ def build_dashboard_payload() -> dict[str, Any]:
             + list(CTA_PROXY_TICKERS.keys())
             + list(CROSS_ASSET_EXTRA_TICKERS)
             + list(LIQUIDITY_MONITOR_TICKERS)
+            + list(VOL_STRUCTURE_TICKERS)
             + list(_factor_ticker_universe())
             + watchlist_tickers
         )
@@ -2728,6 +3452,8 @@ def build_dashboard_payload() -> dict[str, Any]:
     regime_engine = _build_regime_engine(snapshot, sentiment, volume_profile, rotation_signal, yield_curve, cross_asset_confirmation, cta_proxy)
     event_risk = _build_event_risk_overlay()
     liquidity_monitor = _build_liquidity_real_rate_monitor(daily_data, snapshot, volume_profile)
+    volatility_structure = _build_volatility_structure_module(daily_data, snapshot)
+    rotation_flow_map = _build_rotation_flow_map(sector_flow, factor_baskets)
     put_skew = _build_put_skew_monitor(daily_data, snapshot)
 
     alerts = _generate_alerts(
@@ -2770,6 +3496,8 @@ def build_dashboard_payload() -> dict[str, Any]:
         "regime_engine": regime_engine,
         "event_risk": event_risk,
         "liquidity_monitor": liquidity_monitor,
+        "volatility_structure": volatility_structure,
+        "rotation_flow_map": rotation_flow_map,
         "put_skew": put_skew,
         "alerts": alerts,
         "headlines": headlines,

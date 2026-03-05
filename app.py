@@ -12,7 +12,7 @@ from plotly.subplots import make_subplots
 
 from alert_router import route_alerts
 from history_store import load_alert_history, load_snapshot_history, persist_payload
-from market_intel import build_dashboard_payload
+from market_intel import build_dashboard_payload, build_near_52w_low_screener_payload
 
 
 st.set_page_config(
@@ -153,12 +153,20 @@ def _inject_css() -> None:
 def _get_payload() -> dict:
     return build_dashboard_payload()
 
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _get_near_52w_low_screener_payload() -> dict:
+    return build_near_52w_low_screener_payload()
+
 SECTION_NAV_ITEMS = [
     ("overview", "Overview"),
+    ("actionability", "Actionability Lab"),
     ("alerts", "Signal Alerts"),
     ("regime_cross", "Regime + Cross-Asset"),
     ("event_watch", "Event Risk + Watchlist"),
+    ("near_52w_low", "Near 52W Low Screener"),
     ("liquidity", "Liquidity / Real Rates"),
+    ("vol_structure", "Volatility Structure"),
     ("put_skew", "Put Skew"),
     ("capitulation", "Capitulation"),
     ("sector_capitulation", "Sector Capitulation"),
@@ -166,6 +174,7 @@ SECTION_NAV_ITEMS = [
     ("volume", "Volume"),
     ("rotation", "Sector Rotation"),
     ("sector_flow", "Sector Flow"),
+    ("rotation_flow_map", "Rotation Flow Map"),
     ("factor_baskets", "Factor Baskets"),
     ("yield_curve", "Yield Curve"),
     ("sectors", "Sector Performance"),
@@ -1247,6 +1256,137 @@ def _render_liquidity_real_rate_panel(liquidity_monitor: dict) -> None:
     st.caption(str(liquidity_monitor.get("notes", "")))
 
 
+def _volatility_structure_history_chart(history: pd.DataFrame) -> go.Figure:
+    if not isinstance(history, pd.DataFrame) or history.empty:
+        return go.Figure()
+
+    df = history.copy()
+    if "date" not in df.columns:
+        date_candidates = [c for c in df.columns if str(c).strip().lower() in {"index", "datetime", "timestamp", "time"}]
+        if date_candidates:
+            df = df.rename(columns={date_candidates[0]: "date"})
+        else:
+            first_col = df.columns[0]
+            df = df.rename(columns={first_col: "date"})
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    if df.empty:
+        return go.Figure()
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    if "vix" in df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=df["date"],
+                y=df["vix"],
+                mode="lines",
+                name="VIX",
+                line=dict(color="#7db3ff", width=2.0),
+            ),
+            secondary_y=False,
+        )
+    if "vix9d" in df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=df["date"],
+                y=df["vix9d"],
+                mode="lines",
+                name="VIX9D",
+                line=dict(color="#66dca3", width=1.8),
+            ),
+            secondary_y=False,
+        )
+    if "vix3m" in df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=df["date"],
+                y=df["vix3m"],
+                mode="lines",
+                name="VIX3M",
+                line=dict(color="#f6cd61", width=1.8),
+            ),
+            secondary_y=False,
+        )
+    if "slope_spread" in df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=df["date"],
+                y=df["slope_spread"],
+                mode="lines",
+                name="VIX - VIX3M",
+                line=dict(color="#ff8f70", width=2.1, dash="dot"),
+            ),
+            secondary_y=True,
+        )
+    fig.add_hline(y=0, line_dash="dash", line_color="rgba(255,125,125,0.8)", secondary_y=True)
+    fig.update_layout(
+        title="Volatility Term Structure History",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=0, r=20, t=35, b=10),
+        xaxis=dict(gridcolor="rgba(140,170,205,0.18)"),
+        font=dict(color="#ffffff", family="Space Grotesk"),
+        height=340,
+    )
+    fig.update_yaxes(title_text="VIX Levels", gridcolor="rgba(140,170,205,0.18)", secondary_y=False)
+    fig.update_yaxes(title_text="Spread (vol pts)", secondary_y=True)
+    return _apply_chart_theme(fig)
+
+
+def _render_volatility_structure_panel(vol_structure: dict) -> None:
+    st.subheader("Volatility Structure Module")
+
+    structure_regime = vol_structure.get("structure_regime", "Unavailable")
+    stress_regime = vol_structure.get("stress_regime", "Unavailable")
+    slope = vol_structure.get("slope_spread", np.nan)
+    front = vol_structure.get("front_spread", np.nan)
+    score = vol_structure.get("stress_score", np.nan)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        st.metric("Term Regime", str(structure_regime))
+    with c2:
+        st.metric("Stress Regime", str(stress_regime))
+    with c3:
+        st.metric("VIX - VIX3M", f"{slope:+.2f}" if pd.notna(slope) else "n/a")
+    with c4:
+        st.metric("VIX9D - VIX", f"{front:+.2f}" if pd.notna(front) else "n/a")
+    with c5:
+        st.metric("Vol Stress Score", f"{score:.0f}/100" if pd.notna(score) else "n/a")
+
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        delta = vol_structure.get("daily_slope_delta", np.nan)
+        st.metric("1D Slope Delta", f"{delta:+.2f}" if pd.notna(delta) else "n/a")
+    with d2:
+        delta = vol_structure.get("week_slope_delta", np.nan)
+        st.metric("1W Slope Delta", f"{delta:+.2f}" if pd.notna(delta) else "n/a", delta=str(vol_structure.get("week_trend", "n/a")))
+    with d3:
+        delta = vol_structure.get("month_slope_delta", np.nan)
+        st.metric("1M Slope Delta", f"{delta:+.2f}" if pd.notna(delta) else "n/a", delta=str(vol_structure.get("month_trend", "n/a")))
+
+    history = vol_structure.get("history", pd.DataFrame())
+    if isinstance(history, pd.DataFrame) and not history.empty:
+        st.plotly_chart(_volatility_structure_history_chart(history), width="stretch")
+    else:
+        st.info("Volatility term-structure history unavailable.")
+
+    levels = pd.DataFrame(
+        [
+            {"metric": "VIX9D", "value": vol_structure.get("vix9d_level", np.nan)},
+            {"metric": "VIX", "value": vol_structure.get("vix_level", np.nan)},
+            {"metric": "VIX3M", "value": vol_structure.get("vix3m_level", np.nan)},
+            {"metric": "VVIX", "value": vol_structure.get("vvix_level", np.nan)},
+            {"metric": "MOVE", "value": vol_structure.get("move_level", np.nan)},
+            {"metric": "Curve Ratio (VIX/VIX3M)", "value": vol_structure.get("curve_ratio", np.nan)},
+        ]
+    )
+    levels["value"] = levels["value"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "n/a")
+    st.dataframe(levels, width="stretch", hide_index=True)
+    st.caption(str(vol_structure.get("notes", "")))
+
+
 def _render_regime_panel(regime_engine: dict) -> None:
     st.subheader("Regime Engine")
     regime = regime_engine.get("regime", "Unavailable")
@@ -1471,6 +1611,108 @@ def _render_watchlist_panel(watchlist: dict) -> None:
         st.info("Watchlist data unavailable.")
 
 
+
+def _near_low_screener_chart(table: pd.DataFrame, title: str) -> go.Figure:
+    if not isinstance(table, pd.DataFrame) or table.empty:
+        return go.Figure()
+
+    df = table.copy().head(10)
+    if "score" in df:
+        df = df.sort_values("score", ascending=True)
+
+    colors = ["#66dca3" if pd.notna(x) and x >= 60 else "#f6cd61" for x in df.get("score", pd.Series(dtype=float))]
+    fig = go.Figure(
+        go.Bar(
+            x=df.get("score", pd.Series(dtype=float)),
+            y=df.get("ticker", pd.Series(dtype=str)),
+            orientation="h",
+            marker=dict(color=colors),
+            text=[f"{x:.0f}" if pd.notna(x) else "n/a" for x in df.get("score", pd.Series(dtype=float))],
+            textposition="outside",
+            name="Composite Score",
+        )
+    )
+    fig.update_layout(
+        title=title,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=0, r=20, t=35, b=10),
+        xaxis=dict(title="Score", range=[0, 100], gridcolor="rgba(140,170,205,0.18)"),
+        yaxis=dict(title=""),
+        font=dict(color="#ffffff", family="Space Grotesk"),
+        height=320,
+    )
+    return _apply_chart_theme(fig)
+
+
+def _render_near_52w_low_panel(screener: dict) -> None:
+    st.subheader("Near 52-Week Lows With Momentum + Relative Strength")
+
+    coverage = screener.get("coverage", pd.DataFrame())
+    if isinstance(coverage, pd.DataFrame) and not coverage.empty:
+        c1, c2, c3, c4, c5 = st.columns(5)
+        with c1:
+            st.metric("Indexes", str(len(coverage)))
+        with c2:
+            st.metric("Universe", f"{int(coverage['universe_size'].sum()):,}" if "universe_size" in coverage else "n/a")
+        with c3:
+            st.metric("Scanned", f"{int(coverage['scanned'].sum()):,}" if "scanned" in coverage else "n/a")
+        with c4:
+            st.metric("Qualified", f"{int(coverage['qualified'].sum()):,}" if "qualified" in coverage else "n/a")
+        with c5:
+            st.metric("Strict", f"{int(coverage['strict_qualified'].sum()):,}" if "strict_qualified" in coverage else "n/a")
+
+    labels = screener.get("index_labels", {}) if isinstance(screener.get("index_labels", {}), dict) else {}
+    results = screener.get("results", {}) if isinstance(screener.get("results", {}), dict) else {}
+    top_n = int(screener.get("top_n", 10) or 10)
+
+    order = ["russell2000", "sp500", "nasdaq100"]
+    available = [k for k in order if isinstance(results.get(k), pd.DataFrame)]
+
+    if not available:
+        st.info("Screener data unavailable.")
+        return
+
+    if isinstance(coverage, pd.DataFrame) and "used_relaxed" in coverage.columns and bool(coverage["used_relaxed"].fillna(False).any()):
+        st.info("Some indexes have zero strict matches right now, so fallback ranking is shown.")
+    if isinstance(coverage, pd.DataFrame) and "used_broad" in coverage.columns and bool(coverage["used_broad"].fillna(False).any()):
+        st.info("For indexes with no names inside the 10% band, the panel shows nearest lows outside the band as context.")
+
+    tabs = st.tabs([str(labels.get(k, k)) for k in available])
+    for tab, key in zip(tabs, available):
+        with tab:
+            table = results.get(key, pd.DataFrame())
+            if not isinstance(table, pd.DataFrame) or table.empty:
+                st.info("No candidates met the filter right now.")
+                continue
+
+            st.plotly_chart(_near_low_screener_chart(table, f"{labels.get(key, key)} Top {top_n} Candidates"), width='stretch')
+
+            show = table.copy().head(top_n)
+            if "last" in show:
+                show["last"] = show["last"].map(lambda x: f"{x:,.2f}" if pd.notna(x) else "n/a")
+            for col in ["distance_to_52w_low", "ret_5d", "ret_1m", "ret_3m", "rs_1m", "rs_3m"]:
+                if col in show:
+                    show[col] = show[col].map(lambda x: f"{x * 100:+.2f}%" if pd.notna(x) else "n/a")
+            if "score" in show:
+                show["score"] = show["score"].map(lambda x: f"{x:.1f}" if pd.notna(x) else "n/a")
+            if "strict_match" in show:
+                show["strict_match"] = show["strict_match"].map(lambda x: "Yes" if bool(x) else "No")
+
+            display_cols = ["ticker", "name", "last", "distance_to_52w_low", "ret_5d", "ret_1m", "ret_3m", "rs_1m", "score"]
+            if "strict_match" in show:
+                display_cols.append("strict_match")
+
+            st.dataframe(
+                show[display_cols],
+                width='stretch',
+                hide_index=True,
+            )
+
+    notes = str(screener.get("notes", ""))
+    if notes:
+        st.caption(notes)
+
 def _render_alert_routing_panel(routing_status: dict) -> None:
     st.subheader("Alert Routing")
     enabled = bool(routing_status.get("enabled", False))
@@ -1667,6 +1909,102 @@ def _render_sector_flow_panel(sector_flow: dict) -> None:
     st.caption(str(sector_flow.get("notes", "")))
 
 
+def _rotation_flow_sankey_chart(edges: pd.DataFrame, title: str) -> go.Figure:
+    if not isinstance(edges, pd.DataFrame) or edges.empty:
+        return go.Figure()
+    needed = {"source_node", "target_node", "weight", "status", "source", "target"}
+    if not needed.issubset(set(edges.columns)):
+        return go.Figure()
+
+    df = edges.copy()
+    nodes = list(dict.fromkeys(df["source_node"].astype(str).tolist() + df["target_node"].astype(str).tolist()))
+    idx_map = {name: i for i, name in enumerate(nodes)}
+
+    status_colors = {
+        "Retained": "rgba(86, 211, 146, 0.70)",
+        "New": "rgba(125, 179, 255, 0.70)",
+        "Dropped": "rgba(255, 125, 125, 0.70)",
+    }
+    link_colors = [status_colors.get(str(s), "rgba(140,170,205,0.55)") for s in df["status"]]
+    custom = [f"{src} -> {tgt}<br>Status: {status}" for src, tgt, status in zip(df["source"], df["target"], df["status"])]
+
+    fig = go.Figure(
+        go.Sankey(
+            node=dict(
+                label=nodes,
+                color="rgba(12, 32, 52, 0.95)",
+                line=dict(color="rgba(140,170,205,0.40)", width=1),
+                pad=16,
+                thickness=14,
+            ),
+            link=dict(
+                source=[idx_map[str(x)] for x in df["source_node"]],
+                target=[idx_map[str(x)] for x in df["target_node"]],
+                value=[float(x) if pd.notna(x) else 0.0 for x in df["weight"]],
+                color=link_colors,
+                customdata=custom,
+                hovertemplate="%{customdata}<extra></extra>",
+            ),
+        )
+    )
+    fig.update_layout(
+        title=title,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=0, r=0, t=36, b=8),
+        font=dict(color="#ffffff", family="Space Grotesk", size=12),
+        height=380,
+    )
+    return fig
+
+
+def _render_rotation_flow_map_panel(rotation_flow_map: dict) -> None:
+    st.subheader("Sector / Factor Rotation Flow Map")
+
+    sector_turn = _as_float(rotation_flow_map.get("sector_turnover"))
+    factor_turn = _as_float(rotation_flow_map.get("factor_turnover"))
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("Sector Leader Turnover", f"{sector_turn * 100:.0f}%" if pd.notna(sector_turn) else "n/a")
+    with c2:
+        st.metric("Factor Leader Turnover", f"{factor_turn * 100:.0f}%" if pd.notna(factor_turn) else "n/a")
+
+    sector_edges = rotation_flow_map.get("sector_edges", pd.DataFrame())
+    factor_edges = rotation_flow_map.get("factor_edges", pd.DataFrame())
+    tab1, tab2 = st.tabs(["Sectors", "Factors"])
+
+    with tab1:
+        if isinstance(sector_edges, pd.DataFrame) and not sector_edges.empty:
+            st.plotly_chart(_rotation_flow_sankey_chart(sector_edges, "Sector Leadership Flow (Prev -> Today)"), width="stretch")
+            show = sector_edges.copy()
+            if "rank_change" in show.columns:
+                show["rank_change"] = show["rank_change"].map(lambda x: f"{int(x):+d}" if pd.notna(x) else "n/a")
+            st.dataframe(
+                show[["source", "target", "status", "prev_rank", "today_rank", "rank_change"]],
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.info("Sector flow edges unavailable.")
+
+    with tab2:
+        if isinstance(factor_edges, pd.DataFrame) and not factor_edges.empty:
+            st.plotly_chart(_rotation_flow_sankey_chart(factor_edges, "Factor Leadership Flow (Prev -> Today)"), width="stretch")
+            show = factor_edges.copy()
+            if "rank_change" in show.columns:
+                show["rank_change"] = show["rank_change"].map(lambda x: f"{int(x):+d}" if pd.notna(x) else "n/a")
+            st.dataframe(
+                show[["source", "target", "status", "prev_rank", "today_rank", "rank_change"]],
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.info("Factor flow edges unavailable.")
+
+    st.caption(str(rotation_flow_map.get("notes", "")))
+
+
 def _render_headlines(headlines: list[dict]) -> None:
     st.subheader("Market Headlines")
     if not headlines:
@@ -1691,6 +2029,668 @@ def _render_headlines(headlines: list[dict]) -> None:
                 f"<div class='headline-item'><div style='font-weight:600'>{title}</div><div class='mono'>{publisher} | {ts}</div></div>",
                 unsafe_allow_html=True,
             )
+
+
+def _clip_score(value: float) -> float:
+    return float(np.clip(value, 0.0, 100.0))
+
+
+def _setup_tier(score: float) -> str:
+    if score >= 75:
+        return "A (high conviction)"
+    if score >= 60:
+        return "B (tradeable)"
+    if score >= 45:
+        return "C (watch)"
+    return "D (pass)"
+
+
+def _has_confirmed_capitulation(log: pd.DataFrame, direction: str) -> bool:
+    if not isinstance(log, pd.DataFrame) or log.empty:
+        return False
+    required = {"direction", "state"}
+    if not required.issubset(set(log.columns)):
+        return False
+    show = log.copy()
+    if "trigger_date" in show.columns:
+        show["trigger_date"] = pd.to_datetime(show["trigger_date"], errors="coerce")
+        show = show.sort_values("trigger_date")
+    show = show.tail(20)
+    want = str(direction).strip().lower()
+    return bool(
+        (
+            show["direction"].astype(str).str.lower().str.contains(want, na=False)
+            & show["state"].astype(str).str.lower().eq("confirmed")
+        ).any()
+    )
+
+
+def _format_trigger_date(value: object) -> str:
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return "n/a"
+    return ts.strftime("%Y-%m-%d")
+
+
+def _last_condition_timestamp(history_df: pd.DataFrame, mask: pd.Series) -> object:
+    if not isinstance(history_df, pd.DataFrame) or history_df.empty:
+        return None
+    if not isinstance(mask, pd.Series) or mask.empty:
+        return None
+
+    if "timestamp_et" in history_df.columns:
+        time_col = "timestamp_et"
+    elif "ts_utc" in history_df.columns:
+        time_col = "ts_utc"
+    else:
+        return None
+
+    work = history_df.copy()
+    work[time_col] = pd.to_datetime(work[time_col], errors="coerce")
+    aligned_mask = mask.reindex(work.index, fill_value=False).astype(bool)
+    matched = work.loc[aligned_mask & work[time_col].notna(), time_col]
+    if matched.empty:
+        return None
+    return matched.max()
+
+
+def _last_cap_trigger_date(log: pd.DataFrame, direction: str) -> object:
+    if not isinstance(log, pd.DataFrame) or log.empty:
+        return None
+    required = {"direction", "trigger_date"}
+    if not required.issubset(set(log.columns)):
+        return None
+    show = log.copy()
+    show["trigger_date"] = pd.to_datetime(show["trigger_date"], errors="coerce")
+    want = str(direction).strip().lower()
+    filt = show["direction"].astype(str).str.lower().str.contains(want, na=False)
+    matched = show.loc[filt & show["trigger_date"].notna(), "trigger_date"]
+    if matched.empty:
+        return None
+    return matched.max()
+
+
+def _build_actionable_playbook(payload: dict, history_df: pd.DataFrame) -> pd.DataFrame:
+    sentiment = payload.get("sentiment", {})
+    volume = payload.get("volume_profile", {})
+    rotation = payload.get("rotation_signal", {})
+    cta = payload.get("cta_proxy", {})
+    liquidity = payload.get("liquidity_monitor", {})
+    capitulation = payload.get("capitulation", {})
+    put_skew = payload.get("put_skew", {})
+    snapshot = payload.get("snapshot", {})
+
+    sent = _as_float(sentiment.get("composite_score"))
+    breadth = _as_float(sentiment.get("breadth_ratio"))
+    vol_ratio = _as_float(volume.get("ratio"))
+    rot_d = _as_float(rotation.get("spread_daily"))
+    cta_n = _as_float(cta.get("net_score"))
+    liq = _as_float(liquidity.get("liquidity_stress_score"))
+    real_z = _as_float(liquidity.get("real_rate_proxy_z"))
+    down_cap = _as_float(capitulation.get("downside_score"))
+    up_cap = _as_float(capitulation.get("upside_score"))
+    vix = _as_float(snapshot.get("^VIX", {}).get("last"))
+
+    cap_log = capitulation.get("signal_log", pd.DataFrame())
+    down_confirmed = _has_confirmed_capitulation(cap_log, "downside")
+    up_confirmed = _has_confirmed_capitulation(cap_log, "upside")
+    skew_regime = str(put_skew.get("regime", "")).lower()
+
+    h = history_df.copy() if isinstance(history_df, pd.DataFrame) else pd.DataFrame()
+    trend_long_date = None
+    trend_short_date = None
+    if not h.empty:
+        for col in ["sentiment_score", "breadth_ratio", "rotation_daily", "volume_ratio", "cta_net"]:
+            if col in h.columns:
+                h[col] = pd.to_numeric(h[col], errors="coerce")
+        long_mask = pd.Series(False, index=h.index)
+        short_mask = pd.Series(False, index=h.index)
+        needed_cols = {"sentiment_score", "breadth_ratio", "rotation_daily"}
+        if needed_cols.issubset(set(h.columns)):
+            long_mask = (
+                (h["sentiment_score"] >= 20)
+                & (h["breadth_ratio"] >= 0.55)
+                & (h["rotation_daily"] >= 0.0)
+            )
+            short_mask = (
+                (h["sentiment_score"] <= -20)
+                & (h["breadth_ratio"] <= 0.45)
+                & (h["rotation_daily"] <= 0.0)
+            )
+            if "volume_ratio" in h.columns:
+                long_mask = long_mask & (h["volume_ratio"] >= 1.0)
+                short_mask = short_mask & (h["volume_ratio"] >= 1.0)
+        trend_long_date = _last_condition_timestamp(h, long_mask)
+        trend_short_date = _last_condition_timestamp(h, short_mask)
+
+    cap_down_date = _last_cap_trigger_date(cap_log, "downside")
+    cap_up_date = _last_cap_trigger_date(cap_log, "upside")
+
+    trend_long = 30.0
+    trend_long += 22 if pd.notna(sent) and sent >= 20 else (-12 if pd.notna(sent) and sent <= -20 else 0)
+    trend_long += 14 if pd.notna(breadth) and breadth >= 0.55 else (-8 if pd.notna(breadth) and breadth <= 0.45 else 0)
+    trend_long += 14 if pd.notna(rot_d) and rot_d >= 0.002 else (-8 if pd.notna(rot_d) and rot_d <= -0.002 else 0)
+    trend_long += 10 if pd.notna(cta_n) and cta_n >= 20 else (-7 if pd.notna(cta_n) and cta_n <= -20 else 0)
+    trend_long += 12 if pd.notna(liq) and liq <= 45 else (-10 if pd.notna(liq) and liq >= 65 else 0)
+    trend_long += 6 if pd.notna(real_z) and real_z <= 0.50 else (-5 if pd.notna(real_z) and real_z >= 1.20 else 0)
+    trend_long += 4 if pd.notna(vol_ratio) and vol_ratio >= 1.0 else (-2 if pd.notna(vol_ratio) and vol_ratio < 0.80 else 0)
+
+    trend_short = 30.0
+    trend_short += 22 if pd.notna(sent) and sent <= -20 else (-12 if pd.notna(sent) and sent >= 20 else 0)
+    trend_short += 14 if pd.notna(breadth) and breadth <= 0.45 else (-8 if pd.notna(breadth) and breadth >= 0.55 else 0)
+    trend_short += 14 if pd.notna(rot_d) and rot_d <= -0.002 else (-8 if pd.notna(rot_d) and rot_d >= 0.002 else 0)
+    trend_short += 10 if pd.notna(cta_n) and cta_n <= -20 else (-7 if pd.notna(cta_n) and cta_n >= 20 else 0)
+    trend_short += 12 if pd.notna(liq) and liq >= 55 else (-10 if pd.notna(liq) and liq <= 35 else 0)
+    trend_short += 6 if pd.notna(real_z) and real_z >= 0.80 else (-5 if pd.notna(real_z) and real_z <= -0.30 else 0)
+    trend_short += 4 if pd.notna(vol_ratio) and vol_ratio >= 1.0 else (-2 if pd.notna(vol_ratio) and vol_ratio < 0.80 else 0)
+
+    cap_long = 20.0
+    cap_long += 28 if pd.notna(down_cap) and down_cap >= 60 else (10 if pd.notna(down_cap) and down_cap >= 45 else -8)
+    cap_long += 16 if down_confirmed else 0
+    cap_long += 10 if pd.notna(sent) and sent <= -20 else 0
+    cap_long += 8 if pd.notna(vix) and vix >= 22 else 0
+    cap_long += 8 if ("crash" in skew_regime or "downside" in skew_regime) else 0
+    cap_long += 6 if pd.notna(cta_n) and cta_n <= -50 else 0
+    cap_long += -10 if pd.notna(liq) and liq >= 75 else 0
+
+    ex_short = 20.0
+    ex_short += 28 if pd.notna(up_cap) and up_cap >= 60 else (10 if pd.notna(up_cap) and up_cap >= 45 else -8)
+    ex_short += 16 if up_confirmed else 0
+    ex_short += 10 if pd.notna(sent) and sent >= 20 else 0
+    ex_short += 8 if pd.notna(vix) and vix <= 16 else 0
+    ex_short += 8 if ("upside call demand" in skew_regime) else 0
+    ex_short += 6 if pd.notna(cta_n) and cta_n >= 50 else 0
+    ex_short += -10 if pd.notna(liq) and liq <= 25 else 0
+
+    rows = [
+        {
+            "playbook": "Trend Continuation Long",
+            "bias": "Long",
+            "score": _clip_score(trend_long),
+            "why_now": f"Sent {sent:+.0f} | Breadth {breadth * 100:.0f}% | Rotation {_format_pct(rot_d)}",
+            "trigger": "Break/hold above intraday high with breadth >= 55%.",
+            "last_trigger_date": _format_trigger_date(trend_long_date),
+            "invalidation": "Sentiment falls below +5 or cyclical-defensive spread flips negative.",
+        },
+        {
+            "playbook": "Trend Continuation Short",
+            "bias": "Short",
+            "score": _clip_score(trend_short),
+            "why_now": f"Sent {sent:+.0f} | Breadth {breadth * 100:.0f}% | Rotation {_format_pct(rot_d)}",
+            "trigger": "Break/hold below intraday low with breadth <= 45%.",
+            "last_trigger_date": _format_trigger_date(trend_short_date),
+            "invalidation": "Sentiment rises above -5 or rotation turns positive.",
+        },
+        {
+            "playbook": "Downside Capitulation Reversal",
+            "bias": "Long",
+            "score": _clip_score(cap_long),
+            "why_now": f"Cap score {down_cap:.0f} | VIX {vix:.1f} | Confirmed {down_confirmed}",
+            "trigger": "Downside trigger >= 60 plus confirmed reversal within 1-3 bars.",
+            "last_trigger_date": _format_trigger_date(cap_down_date),
+            "invalidation": "No follow-through after confirmation or severe liquidity stress keeps rising.",
+        },
+        {
+            "playbook": "Upside Exhaustion Fade",
+            "bias": "Short",
+            "score": _clip_score(ex_short),
+            "why_now": f"Exhaust score {up_cap:.0f} | VIX {vix:.1f} | Confirmed {up_confirmed}",
+            "trigger": "Upside trigger >= 60 plus confirmed reversal within 1-3 bars.",
+            "last_trigger_date": _format_trigger_date(cap_up_date),
+            "invalidation": "No downside follow-through after confirmation or breadth re-accelerates.",
+        },
+    ]
+
+    table = pd.DataFrame(rows)
+    table["tier"] = table["score"].map(_setup_tier)
+    table = table.sort_values("score", ascending=False).reset_index(drop=True)
+    return table
+
+
+def _signal_shift_chart(events: pd.DataFrame) -> go.Figure:
+    if not isinstance(events, pd.DataFrame) or events.empty:
+        return go.Figure()
+
+    df = events.copy().head(10).sort_values("shock", ascending=True)
+    colors = ["#56d392" if x >= 0 else "#ff7d7d" for x in df["shock"]]
+
+    fig = go.Figure(
+        go.Bar(
+            x=df["shock"],
+            y=df["metric"],
+            orientation="h",
+            marker=dict(color=colors),
+            text=df["delta_text"],
+            textposition="outside",
+            name="Shock",
+        )
+    )
+    fig.add_vline(x=0, line_dash="dot", line_color="rgba(140,170,205,0.7)")
+    fig.update_layout(
+        title="Latest Signal Shifts",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=0, r=20, t=35, b=10),
+        xaxis=dict(title="Shock (z-score proxy)", gridcolor="rgba(140,170,205,0.18)"),
+        yaxis=dict(title=""),
+        font=dict(color="#ffffff", family="Space Grotesk"),
+        height=320,
+    )
+    return _apply_chart_theme(fig)
+
+
+def _build_signal_change_snapshot(history_df: pd.DataFrame) -> dict:
+    if not isinstance(history_df, pd.DataFrame) or history_df.empty or len(history_df) < 2:
+        return {"pulse": "Unavailable", "pulse_score": np.nan, "events": pd.DataFrame(), "current_time": None}
+
+    df = history_df.copy()
+    if "timestamp_et" in df.columns:
+        df = df.sort_values("timestamp_et")
+    elif "ts_utc" in df.columns:
+        df = df.sort_values("ts_utc")
+    df = df.tail(72).reset_index(drop=True)
+
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    specs = [
+        ("sentiment_score", "Sentiment", 12.0, 1, "pts"),
+        ("breadth_ratio", "Breadth", 0.06, 1, "ratio"),
+        ("volume_ratio", "Volume Ratio", 0.15, 1, "x"),
+        ("cta_net", "CTA Proxy", 10.0, 1, "pts"),
+        ("rotation_daily", "Rotation Spread", 0.0035, 1, "pct"),
+        ("vix", "VIX", 1.20, -1, "pts"),
+        ("spx_change", "S&P 500", 0.0025, 1, "pct"),
+        ("ndx_change", "Nasdaq", 0.0030, 1, "pct"),
+    ]
+
+    rows: list[dict] = []
+    pulse_score = 0.0
+    shift_count = 0
+
+    for col, label, threshold, orientation, unit in specs:
+        if col not in df.columns:
+            continue
+        cur_val = _as_float(curr.get(col))
+        prev_val = _as_float(prev.get(col))
+        if pd.isna(cur_val) or pd.isna(prev_val):
+            continue
+
+        delta = float(cur_val - prev_val)
+        diff_series = pd.to_numeric(df[col], errors="coerce").diff().dropna()
+        sigma = _as_float(diff_series.std(ddof=0)) if not diff_series.empty else np.nan
+        z_score = delta / sigma if pd.notna(sigma) and sigma > 1e-9 else np.nan
+        intensity = abs(delta) / threshold if threshold > 0 else np.nan
+        is_shift = bool(abs(delta) >= threshold or (pd.notna(z_score) and abs(z_score) >= 1.5))
+
+        risk_impulse = orientation * float(np.clip(delta / threshold, -3.0, 3.0))
+        if is_shift:
+            pulse_score += risk_impulse
+            shift_count += 1
+
+        if unit == "pct":
+            delta_text = f"{delta * 100:+.2f}%"
+        elif unit == "x":
+            delta_text = f"{delta:+.2f}x"
+        elif unit == "ratio":
+            delta_text = f"{delta * 100:+.1f} pp"
+        else:
+            delta_text = f"{delta:+.2f}"
+
+        if not is_shift:
+            state = "Steady"
+        else:
+            state = "Risk-on impulse" if risk_impulse > 0 else "Risk-off impulse"
+
+        shock = z_score if pd.notna(z_score) else (np.sign(delta) * intensity)
+        rows.append(
+            {
+                "metric": label,
+                "current": cur_val,
+                "previous": prev_val,
+                "delta": delta,
+                "delta_text": delta_text,
+                "z_score": z_score,
+                "shock": float(shock) if pd.notna(shock) else 0.0,
+                "state": state,
+                "is_shift": is_shift,
+            }
+        )
+
+    events = pd.DataFrame(rows)
+    if not events.empty:
+        events = events.sort_values(["is_shift", "shock"], ascending=[False, False]).reset_index(drop=True)
+
+    if shift_count == 0:
+        pulse = "Stable / no major shift"
+    elif pulse_score >= 2.0:
+        pulse = "Risk-on impulse"
+    elif pulse_score <= -2.0:
+        pulse = "Risk-off impulse"
+    else:
+        pulse = "Mixed impulse"
+
+    current_time = curr.get("timestamp_et") if "timestamp_et" in curr else curr.get("ts_utc")
+    return {
+        "pulse": pulse,
+        "pulse_score": pulse_score,
+        "shift_count": shift_count,
+        "events": events,
+        "current_time": current_time,
+    }
+
+
+def _bucket_sentiment(value: float) -> str:
+    if pd.isna(value):
+        return "sent:unknown"
+    if value >= 25:
+        return "sent:strong_on"
+    if value >= 5:
+        return "sent:on"
+    if value <= -25:
+        return "sent:strong_off"
+    if value <= -5:
+        return "sent:off"
+    return "sent:neutral"
+
+
+def _bucket_volume(value: float) -> str:
+    if pd.isna(value):
+        return "vol:unknown"
+    if value >= 1.15:
+        return "vol:heavy"
+    if value <= 0.90:
+        return "vol:light"
+    return "vol:normal"
+
+
+def _bucket_vix(value: float) -> str:
+    if pd.isna(value):
+        return "vix:unknown"
+    if value >= 22:
+        return "vix:high"
+    if value <= 16:
+        return "vix:low"
+    return "vix:mid"
+
+
+def _bucket_breadth(value: float) -> str:
+    if pd.isna(value):
+        return "breadth:unknown"
+    if value >= 0.60:
+        return "breadth:strong"
+    if value <= 0.40:
+        return "breadth:weak"
+    return "breadth:mixed"
+
+
+def _build_regime_conditioned_probabilities(payload: dict, history_df: pd.DataFrame, horizon_bars: int = 4, min_samples: int = 24) -> dict:
+    needed = {"spx_change", "ndx_change", "sentiment_score", "volume_ratio", "vix", "breadth_ratio"}
+    if not isinstance(history_df, pd.DataFrame) or history_df.empty or not needed.issubset(set(history_df.columns)):
+        return {"available": False, "reason": "Not enough stored history for conditioned probabilities."}
+
+    df = history_df.copy()
+    if "timestamp_et" in df.columns:
+        df = df.sort_values("timestamp_et")
+    elif "ts_utc" in df.columns:
+        df = df.sort_values("ts_utc")
+
+    for col in needed:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["state_full"] = (
+        df["sentiment_score"].map(_bucket_sentiment)
+        + " | "
+        + df["volume_ratio"].map(_bucket_volume)
+        + " | "
+        + df["vix"].map(_bucket_vix)
+        + " | "
+        + df["breadth_ratio"].map(_bucket_breadth)
+    )
+    df["state_coarse"] = df["sentiment_score"].map(_bucket_sentiment) + " | " + df["volume_ratio"].map(_bucket_volume)
+
+    df["fwd_spx"] = df["spx_change"].shift(-horizon_bars) - df["spx_change"]
+    df["fwd_ndx"] = df["ndx_change"].shift(-horizon_bars) - df["ndx_change"]
+    valid = df.dropna(subset=["fwd_spx", "fwd_ndx", "state_full", "state_coarse"]).copy()
+    if len(valid) < max(30, min_samples):
+        return {"available": False, "reason": "Need more snapshots before probability estimates become reliable."}
+
+    def _aggregate(state_col: str) -> pd.DataFrame:
+        grouped_rows = []
+        for state, grp in valid.groupby(state_col):
+            samples = int(len(grp))
+            if samples < 8:
+                continue
+            grouped_rows.append(
+                {
+                    "state": str(state),
+                    "samples": samples,
+                    "spx_up_prob": float((grp["fwd_spx"] > 0).mean() * 100.0),
+                    "ndx_up_prob": float((grp["fwd_ndx"] > 0).mean() * 100.0),
+                    "spx_median_move": float(grp["fwd_spx"].median() * 100.0),
+                    "ndx_median_move": float(grp["fwd_ndx"].median() * 100.0),
+                }
+            )
+        out = pd.DataFrame(grouped_rows)
+        if not out.empty:
+            out = out.sort_values("samples", ascending=False).reset_index(drop=True)
+        return out
+
+    full_probs = _aggregate("state_full")
+    coarse_probs = _aggregate("state_coarse")
+
+    base_spx = float((valid["fwd_spx"] > 0).mean() * 100.0)
+    base_ndx = float((valid["fwd_ndx"] > 0).mean() * 100.0)
+
+    current_sent = _as_float(payload.get("sentiment", {}).get("composite_score"))
+    current_vol = _as_float(payload.get("volume_profile", {}).get("ratio"))
+    current_vix = _as_float(payload.get("snapshot", {}).get("^VIX", {}).get("last"))
+    current_breadth = _as_float(payload.get("sentiment", {}).get("breadth_ratio"))
+    current_full = (
+        f"{_bucket_sentiment(current_sent)} | {_bucket_volume(current_vol)} | {_bucket_vix(current_vix)} | {_bucket_breadth(current_breadth)}"
+    )
+    current_coarse = f"{_bucket_sentiment(current_sent)} | {_bucket_volume(current_vol)}"
+
+    current = pd.DataFrame()
+    conditioning = "full"
+    if not full_probs.empty:
+        current = full_probs[full_probs["state"] == current_full].copy()
+    if current.empty or int(current["samples"].iloc[0]) < min_samples:
+        conditioning = "coarse"
+        if not coarse_probs.empty:
+            current = coarse_probs[coarse_probs["state"] == current_coarse].copy()
+
+    if current.empty:
+        return {
+            "available": False,
+            "reason": "Current regime state has too few historical matches so far.",
+            "baseline_spx": base_spx,
+            "baseline_ndx": base_ndx,
+        }
+
+    current_row = current.iloc[0].to_dict()
+    edge = coarse_probs.copy() if not coarse_probs.empty else full_probs.copy()
+    if not edge.empty:
+        edge["spx_edge"] = edge["spx_up_prob"] - base_spx
+        edge["ndx_edge"] = edge["ndx_up_prob"] - base_ndx
+        edge["edge_abs"] = edge[["spx_edge", "ndx_edge"]].abs().max(axis=1)
+        edge = edge[edge["samples"] >= min_samples].sort_values("edge_abs", ascending=False).head(10).reset_index(drop=True)
+
+    return {
+        "available": True,
+        "conditioning": conditioning,
+        "horizon_bars": int(horizon_bars),
+        "current_state": current_row.get("state", "n/a"),
+        "current": current_row,
+        "baseline_spx": base_spx,
+        "baseline_ndx": base_ndx,
+        "samples_total": int(len(valid)),
+        "edge_table": edge,
+    }
+
+
+def _regime_probability_chart(prob: dict) -> go.Figure:
+    if not isinstance(prob, dict) or not prob.get("available", False):
+        return go.Figure()
+
+    current = prob.get("current", {})
+    base_spx = _as_float(prob.get("baseline_spx"))
+    base_ndx = _as_float(prob.get("baseline_ndx"))
+    cur_spx = _as_float(current.get("spx_up_prob"))
+    cur_ndx = _as_float(current.get("ndx_up_prob"))
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=["S&P 500", "Nasdaq"],
+            y=[base_spx, base_ndx],
+            name="Baseline",
+            marker=dict(color="rgba(125, 179, 255, 0.65)"),
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            x=["S&P 500", "Nasdaq"],
+            y=[cur_spx, cur_ndx],
+            name="Current Regime Match",
+            marker=dict(color="rgba(86, 211, 146, 0.85)"),
+        )
+    )
+    fig.update_layout(
+        title="Probability of Higher Print Over Forward Horizon",
+        barmode="group",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=0, r=20, t=35, b=10),
+        yaxis=dict(title="Probability (%)", range=[0, 100], gridcolor="rgba(140,170,205,0.18)"),
+        xaxis=dict(title=""),
+        font=dict(color="#ffffff", family="Space Grotesk"),
+        height=300,
+    )
+    return _apply_chart_theme(fig)
+
+
+def _render_actionability_panel(payload: dict, history_df: pd.DataFrame, history_prob_df: pd.DataFrame) -> None:
+    st.subheader("Actionability Lab")
+    st.caption("Structured trade planning from current regime, signal shifts, and empirical state probabilities.")
+
+    tab1, tab2, tab3 = st.tabs(["Playbook", "Change Detection", "Regime Probabilities"])
+
+    with tab1:
+        table = _build_actionable_playbook(payload, history_df)
+        if table.empty:
+            st.info("Playbook unavailable.")
+        else:
+            top = table.iloc[0]
+            c1, c2, c3, c4, c5 = st.columns(5)
+            with c1:
+                st.metric("Top Setup", str(top.get("playbook", "n/a")))
+            with c2:
+                st.metric("Bias", str(top.get("bias", "n/a")))
+            with c3:
+                st.metric("Score", f"{float(top.get('score', np.nan)):.0f}/100")
+            with c4:
+                st.metric("Tier", str(top.get("tier", "n/a")))
+            with c5:
+                st.metric("Last Trigger", str(top.get("last_trigger_date", "n/a")))
+
+            show = table.copy()
+            show["score"] = show["score"].map(lambda x: f"{x:.0f}")
+            st.dataframe(
+                show[["playbook", "bias", "score", "tier", "last_trigger_date", "why_now", "trigger", "invalidation"]],
+                width="stretch",
+                hide_index=True,
+            )
+            st.caption(
+                "Trigger dates show the most recent model trigger match. For trend setups, date reflects the last snapshot matching regime trigger conditions."
+            )
+
+    with tab2:
+        shift = _build_signal_change_snapshot(history_df)
+        pulse = shift.get("pulse", "Unavailable")
+        pulse_score = _as_float(shift.get("pulse_score"))
+        shift_count = int(shift.get("shift_count", 0))
+        current_time = shift.get("current_time")
+        time_text = (
+            pd.to_datetime(current_time, errors="coerce").strftime("%Y-%m-%d %I:%M %p")
+            if current_time is not None and pd.notna(pd.to_datetime(current_time, errors="coerce"))
+            else "n/a"
+        )
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Pulse State", str(pulse))
+        with c2:
+            st.metric("Pulse Score", f"{pulse_score:+.2f}" if pd.notna(pulse_score) else "n/a")
+        with c3:
+            st.metric("Active Shifts", str(shift_count), delta=f"as of {time_text}")
+
+        events = shift.get("events", pd.DataFrame())
+        if isinstance(events, pd.DataFrame) and not events.empty:
+            flagged = events[events["is_shift"]].copy()
+            if flagged.empty:
+                st.info("No metrics crossed shift thresholds on the latest snapshot.")
+            else:
+                st.plotly_chart(_signal_shift_chart(flagged), width="stretch")
+                show = flagged.copy()
+                show["z_score"] = show["z_score"].map(lambda x: f"{x:+.2f}" if pd.notna(x) else "n/a")
+                st.dataframe(
+                    show[["metric", "delta_text", "z_score", "state"]].head(12),
+                    width="stretch",
+                    hide_index=True,
+                )
+        else:
+            st.info("Change-detection history unavailable.")
+
+    with tab3:
+        prob = _build_regime_conditioned_probabilities(payload, history_prob_df)
+        if not bool(prob.get("available", False)):
+            st.info(str(prob.get("reason", "Regime probabilities unavailable.")))
+        else:
+            current = prob.get("current", {})
+            conditioning = str(prob.get("conditioning", "n/a"))
+            horizon = int(prob.get("horizon_bars", 0))
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.metric("Conditioning", conditioning.title())
+            with c2:
+                st.metric("Samples", str(int(current.get("samples", 0))))
+            with c3:
+                st.metric("S&P Up Prob", f"{float(current.get('spx_up_prob', np.nan)):.1f}%")
+            with c4:
+                st.metric("Nasdaq Up Prob", f"{float(current.get('ndx_up_prob', np.nan)):.1f}%")
+
+            st.plotly_chart(_regime_probability_chart(prob), width="stretch")
+            st.caption(
+                f"Forward horizon uses {horizon} snapshots. Current state: {prob.get('current_state', 'n/a')}"
+            )
+
+            edge = prob.get("edge_table", pd.DataFrame())
+            if isinstance(edge, pd.DataFrame) and not edge.empty:
+                show = edge.copy()
+                for col in ["spx_up_prob", "ndx_up_prob", "spx_edge", "ndx_edge"]:
+                    if col in show.columns:
+                        show[col] = show[col].map(lambda x: f"{x:+.1f}%" if pd.notna(x) else "n/a")
+                for col in ["spx_median_move", "ndx_median_move"]:
+                    if col in show.columns:
+                        show[col] = show[col].map(lambda x: f"{x:+.2f}%" if pd.notna(x) else "n/a")
+                st.markdown("**Highest-Edge Historical States**")
+                st.dataframe(
+                    show[
+                        [
+                            "state",
+                            "samples",
+                            "spx_up_prob",
+                            "ndx_up_prob",
+                            "spx_edge",
+                            "ndx_edge",
+                            "spx_median_move",
+                            "ndx_median_move",
+                        ]
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
 
 
 def _render_history_panel(history_df: pd.DataFrame) -> None:
@@ -1736,9 +2736,10 @@ def _render_sidebar_navigation() -> str:
 
     quick_targets = [
         ("Overview", "overview"),
+        ("Actionability", "actionability"),
+        ("Near Lows", "near_52w_low"),
         ("Liquidity", "liquidity"),
         ("Yield Curve", "yield_curve"),
-        ("Capitulation", "capitulation"),
         ("Headlines", "headlines"),
     ]
     q1, q2 = st.sidebar.columns(2)
@@ -1822,6 +2823,36 @@ def main() -> None:
     manual_refresh = st.sidebar.button("Refresh now", width="stretch")
     selected_section = _render_sidebar_navigation()
 
+    if "near_low_requested" not in st.session_state:
+        st.session_state["near_low_requested"] = False
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Near-Low Screener")
+    load_near_low = st.sidebar.button("Load 52W Low Screener", width="stretch")
+    refresh_near_low = st.sidebar.button(
+        "Refresh 52W Low Screener",
+        width="stretch",
+        disabled=not bool(st.session_state.get("near_low_requested", False)),
+    )
+    unload_near_low = st.sidebar.button(
+        "Unload 52W Low Screener",
+        width="stretch",
+        disabled=not bool(st.session_state.get("near_low_requested", False)),
+    )
+
+    if load_near_low:
+        st.session_state["near_low_requested"] = True
+    if refresh_near_low:
+        _get_near_52w_low_screener_payload.clear()
+        st.session_state["near_low_requested"] = True
+    if unload_near_low:
+        st.session_state["near_low_requested"] = False
+
+    st.sidebar.markdown(
+        f"<div class='mono'>52W Screener: {'Loaded' if st.session_state.get('near_low_requested', False) else 'Not loaded'}</div>",
+        unsafe_allow_html=True,
+    )
+
     if manual_refresh:
         st.cache_data.clear()
 
@@ -1848,6 +2879,7 @@ def main() -> None:
         st.sidebar.warning(f"Alert routing skipped: {exc}")
 
     history_df = load_snapshot_history(hours=72)
+    history_prob_df = load_snapshot_history(hours=24 * 120)
     alert_history = load_alert_history(limit=80)
 
     updated_at = payload.get("updated_at")
@@ -1880,6 +2912,11 @@ def main() -> None:
             _render_sentiment_panel(payload.get("sentiment", {}))
             st.markdown("</div>", unsafe_allow_html=True)
 
+    if _section_visible(selected_section, "actionability"):
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        _render_actionability_panel(payload, history_df, history_prob_df)
+        st.markdown("</div>", unsafe_allow_html=True)
+
     if _section_visible(selected_section, "alerts"):
         _render_alerts(payload.get("alerts", []), alert_history)
 
@@ -1905,9 +2942,24 @@ def main() -> None:
             _render_watchlist_panel(payload.get("watchlist", {}))
             st.markdown("</div>", unsafe_allow_html=True)
 
+    if _section_visible(selected_section, "near_52w_low"):
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        if not bool(st.session_state.get("near_low_requested", False)):
+            st.info("Press 'Load 52W Low Screener' in the sidebar to fetch this dataset on demand.")
+        else:
+            with st.spinner("Loading near-52-week-low screener..."):
+                near_low_payload = _get_near_52w_low_screener_payload()
+            _render_near_52w_low_panel(near_low_payload)
+        st.markdown("</div>", unsafe_allow_html=True)
+
     if _section_visible(selected_section, "liquidity"):
         st.markdown("<div class='panel'>", unsafe_allow_html=True)
         _render_liquidity_real_rate_panel(payload.get("liquidity_monitor", {}))
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if _section_visible(selected_section, "vol_structure"):
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        _render_volatility_structure_panel(payload.get("volatility_structure", {}))
         st.markdown("</div>", unsafe_allow_html=True)
 
     if _section_visible(selected_section, "put_skew"):
@@ -1943,6 +2995,11 @@ def main() -> None:
     if _section_visible(selected_section, "sector_flow"):
         st.markdown("<div class='panel'>", unsafe_allow_html=True)
         _render_sector_flow_panel(payload.get("sector_flow", {}))
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if _section_visible(selected_section, "rotation_flow_map"):
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        _render_rotation_flow_map_panel(payload.get("rotation_flow_map", {}))
         st.markdown("</div>", unsafe_allow_html=True)
 
     if _section_visible(selected_section, "factor_baskets"):
